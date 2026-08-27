@@ -498,13 +498,23 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
             page_sizes = [p["size"] for p in paragraphs]
             page_body_size = max(page_sizes) if page_sizes else 0
 
+            # Page-anchored furniture (folios, running heads) lives in the
+            # top/bottom margin band and must NOT ride the reflow chain --
+            # a folio is anchored to the *page*, not to the text flow, so
+            # letting it inherit the body's accumulated shift moves it
+            # (sometimes hundreds of points) away from where it belongs. See
+            # the `pinned` branch in place() below.
+            page_h = page.rect.height
+            header_band = page_h * 0.12
+            footer_band = page_h * 0.88
+
             prev_orig_y1 = None
             prev_new_y1 = None
             prev_was_small_text = False
             prev_was_short = False
             placements = []
 
-            def place(para, translated, single_line):
+            def place(para, translated, single_line, pinned=False):
                 nonlocal prev_orig_y1, prev_new_y1, prev_was_small_text, prev_was_short
                 x0, x1 = para["bbox"].x0, para["bbox"].x1
                 if single_line:
@@ -527,6 +537,21 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
                 is_tight_run = (prev_was_small_text and is_small_text) or (
                     prev_was_short and is_short
                 )
+                if pinned:
+                    # Keep its original y and skip the prev_orig_y1/prev_new_y1
+                    # chain entirely, so it neither inherits the body's
+                    # accumulated shift nor passes a bogus gap on to whatever
+                    # follows (deliberately returns before prev_was_small_text/
+                    # prev_was_short are updated -- a folio between two
+                    # footnote entries shouldn't break tight-run detection for
+                    # the entry after it).
+                    new_y0 = para["bbox"].y0
+                    needed_h = measure_height(width, translated, size, single_line)
+                    placements.append((
+                        fitz.Rect(x0, new_y0, x1, new_y0 + needed_h + 2),
+                        translated, size, single_line,
+                    ))
+                    return
                 if prev_new_y1 is None:
                     new_y0 = para["bbox"].y0  # first paragraph on the page: keep as-is
                 elif skip_translation and is_tight_run:
@@ -558,7 +583,10 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
                 # `place()` must still be called or the page number is simply
                 # erased with nothing drawn back in its place.
                 if re.fullmatch(r"[\[\(]?\s*[-–—]?\s*\d{1,4}\s*[-–—]?\s*[\]\)]?", text):
-                    place(para, text, para["single_line"])
+                    in_margin_band = (
+                        para["bbox"].y1 <= header_band or para["bbox"].y0 >= footer_band
+                    )
+                    place(para, text, para["single_line"], pinned=in_margin_band)
                     continue
 
                 if skip_translation:

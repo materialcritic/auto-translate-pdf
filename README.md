@@ -250,3 +250,17 @@ and burned as a false failure; several smaller robustness/hygiene issues
 older schema, CSV log rows breaking on multi-line error text, the
 now-deprecated `import fitz`, and an `hf_transfer` dependency that never
 actually activated).
+
+### Follow-up: page-number regression from the first patch
+
+A second audit pass caught a regression in the page-number fix above: once
+folios started calling `place()` instead of being silently dropped, they
+joined the same reflow chain as body text — a folio is anchored to the
+*page*, not to the text flow, so inheriting the body's accumulated shift
+could move it hundreds of points, and (worse) a header folio being the
+*first* paragraph on the page made it the anchor that pushed all the body
+text below it up by tens of points on every page with a running head.
+Fixed by pinning any digit-only paragraph inside the top/bottom 12% margin
+band to its original position, entirely outside the `prev_orig_y1`/
+`prev_new_y1` chain. Verified against both the footer-folio and
+header-folio fixtures from the report.
