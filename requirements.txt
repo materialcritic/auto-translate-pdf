@@ -1,4 +1,3 @@
 mlx-lm==0.31.3
 pymupdf==1.28.2
 huggingface_hub==1.28.0
-hf_transfer==0.1.9

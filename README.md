@@ -175,15 +175,6 @@ Two things only matter in this mode:
 - **Very short italic phrases** (2-3 words) occasionally lose the `*...*`
   marker during translation and render as plain text — content is never
   lost, just the emphasis styling on that one phrase.
-- **Reformat-only mode's tight-gap fix doesn't reach every case.** A title
-  page's byline/subtitle stack can still show large gaps even though the
-  "short paragraph" tight-gap logic correctly fires for it — the actual
-  cause there is `measure_height()` under-computing width for a very narrow
-  single-line heading (a short byline like "Peter Stein" can wrap to 2-3
-  lines internally at the width it's given, and that wasted internal height
-  is what reads as a gap, not the gap logic itself). Not yet fixed —
-  isolated to title-page heading stacks, doesn't affect body prose or
-  footnote/reference lists.
 - **A hyphenated word split across a line break can leave a residual
   fragment if the split happens right at a paragraph-merge boundary edge
   case not yet covered** (the common case — including hyphenation across an
@@ -195,7 +186,9 @@ Two things only matter in this mode:
   fluent, idiomatic English on academic German prose, but isn't a substitute
   for professional translation of anything high-stakes.
 - **Only handles single-column, prose-heavy layouts well.** No table
-  support, no multi-column layout support, no image/figure handling.
+  support, no multi-column layout support. Embedded images/figures are left
+  untouched (the page-wide text redaction explicitly excludes them) but
+  aren't captioned or otherwise processed.
 - Assumes German → English. There's no language auto-detection; dropping a
   non-German PDF will still run it through the DE→EN model.
 - Each run loads a ~2 GB model into memory — a full 14-page document took
@@ -208,3 +201,46 @@ Two things only matter in this mode:
 MIT for the code in this repo. The model it downloads and runs
 (`mlx-community/translategemma-4b-it-4bit`, derived from Google's Gemma 3) is
 distributed separately under its own [Gemma license terms](https://ai.google.dev/gemma/terms).
+
+## Change history (post-publish fixes)
+
+An external audit found several real bugs after this was first published,
+most consequentially:
+
+- **A phantom `2em` vertical margin on every paragraph.** `BODY_CSS` reset
+  margins with a universal selector (`* { margin: 0 }`), but that has CSS
+  specificity 0 and loses to MuPDF's user-agent `p { margin: 1em 0 }` --
+  every paragraph silently carried an extra 2× its own font size in blank
+  space. This was the true root cause of the "oversized gap between every
+  footnote" bug fixed earlier, and of what this file previously documented
+  as a separate, unfixed "title-page heading stack" spacing bug — that
+  diagnosis (a width-measurement issue) was wrong; it was this margin all
+  along. Fixed with an explicit `p, div, body { margin: 0 }` rule.
+- **Bare page numbers were being deleted**, not left untranslated as
+  intended — their bbox was folded into the page-wide redaction, but the
+  `continue` that skipped translating them also skipped placing them back.
+- **De-hyphenation ran as a global regex over already-joined paragraph
+  text**, matching *any* hyphen followed by whitespace rather than only one
+  that ended a source line -- corrupting ordinary German suspended
+  compounds ("Sozial- und Wirtschaftsgeschichte" -> "Sozialund
+  Wirtschaftsgeschichte") and dash-as-punctuation usage, not just an edge
+  case at paragraph-merge boundaries. Rewritten to de-hyphenate at the line
+  join, where line boundaries still exist.
+- **The page-wide text redaction was also deleting embedded images**
+  (PyMuPDF's default redaction blanks image pixels intersecting the
+  redaction rect). Now scoped to text only.
+- **`fitz.Archive` ran at module import time**, so a missing font directory
+  (any non-macOS system, or a machine without these specific fonts) made
+  the whole module unimportable with a traceback that a Folder Action would
+  swallow silently. Now built lazily on first use, with a fallback font
+  list and an actionable error.
+
+Also fixed: same-row line fragments could be joined out of left-to-right
+order; the watcher now persists progress after every file (was: only at the
+end of a whole run) and doesn't retire a permanently-failing file into the
+same "done" bucket as a real success; a file mid-copy is no longer grabbed
+and burned as a false failure; several smaller robustness/hygiene issues
+(case-sensitive `.pdf` matching, a state file that could `KeyError` on an
+older schema, CSV log rows breaking on multi-line error text, the
+now-deprecated `import fitz`, and an `hf_transfer` dependency that never
+actually activated).
