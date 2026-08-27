@@ -12,6 +12,12 @@ Translation is done by [TranslateGemma 4B](https://huggingface.co/google/transla
 (Google's Gemma 3 fine-tuned for translation), running via
 [`mlx-lm`](https://github.com/ml-explore/mlx-lm) on Apple Silicon.
 
+No Apple Silicon handy? [**Open `colab_translate.ipynb` in Colab**](https://colab.research.google.com/github/materialcritic/auto-translate-pdf/blob/main/colab_translate.ipynb)
+runs the same pipeline on a free Colab GPU via `transformers` + 4-bit
+`bitsandbytes` instead of `mlx-lm` — upload a PDF, run it, download the
+result. No Folder Action there (that part's macOS-only); it's a one-document-
+at-a-time notebook.
+
 ## Setup
 
 ```bash
