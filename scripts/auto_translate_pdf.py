@@ -87,6 +87,17 @@ def is_translated_output(p: Path) -> bool:
     return p.stem.lower().endswith(EN_SUFFIX)
 
 
+def file_key(p: Path) -> str:
+    """Path alone is not enough: replacing a file with a corrected scan
+    under the same name would otherwise be skipped forever as 'already
+    done', since done/attempts/failed are keyed on nothing but the relative
+    path. Folding in size and mtime means a replaced file gets a new key
+    and is retranslated once; old state-file entries just won't match the
+    new key and degrade gracefully rather than erroring."""
+    st = p.stat()
+    return f"{p.relative_to(FOLDER)}:{st.st_size}:{int(st.st_mtime)}"
+
+
 def progress(line: str) -> None:
     ts = time.strftime("%H:%M:%S")
     with open(PROGRESS_FILE, "a") as f:
@@ -158,8 +169,8 @@ def _main():
     pending = [
         p for p in pdfs
         if not is_translated_output(p)
-        and str(p.relative_to(FOLDER)) not in done
-        and str(p.relative_to(FOLDER)) not in failed
+        and file_key(p) not in done
+        and file_key(p) not in failed
     ]
 
     if not pending:
@@ -181,7 +192,7 @@ def _main():
         return
 
     for p in pending:
-        key = str(p.relative_to(FOLDER))
+        key = file_key(p)
         out = output_path(p)
 
         if out.exists():

@@ -40,18 +40,26 @@ def load_model(model_name):
     model, tokenizer = load(model_name)
     # The tokenizer's default eos_token_id doesn't include <end_of_turn>,
     # which is what this chat template actually emits to end a response --
-    # without this, generation runs to max_tokens on every paragraph. Using
-    # add_eos_token() (not a length check on a manual encode()) means a
-    # tokenizer where this token doesn't resolve cleanly raises here, loudly,
-    # instead of silently falling through to the same slow-generation
-    # failure this is meant to prevent.
+    # without this, generation runs to max_tokens on every paragraph.
+    #
+    # mlx-lm's own add_eos_token() looks like a loud guard against this (it
+    # raises if convert_tokens_to_ids returns None) but the guard is
+    # fictional: HF's convert_tokens_to_ids returns unk_token_id, not None,
+    # for a token that isn't in the vocab, so that check never fires and an
+    # unrelated unk id gets silently registered as an EOS token instead --
+    # strictly worse than the failure it was meant to catch. Verify the id
+    # explicitly before handing it to add_eos_token.
     try:
-        tokenizer.add_eos_token("<end_of_turn>")
-    except (ValueError, AttributeError) as e:
+        eot = tokenizer.convert_tokens_to_ids("<end_of_turn>")
+    except Exception as e:
+        raise RuntimeError(f"Could not resolve <end_of_turn> for {model_name}: {e}") from e
+    unk = getattr(tokenizer, "unk_token_id", None)
+    if eot is None or (unk is not None and eot == unk):
         raise RuntimeError(
-            f"Could not register <end_of_turn> as an EOS token for {model_name}: "
-            f"{e}. Without it every generation runs to max_tokens."
-        ) from e
+            f"<end_of_turn> is not a real token for {model_name}. Without it "
+            "every generation runs to max_tokens."
+        )
+    tokenizer.add_eos_token("<end_of_turn>")
     return model, tokenizer
 
 
@@ -107,39 +115,83 @@ def span_is_italic(span):
     return bool(span["flags"] & 2) or "italic" in font.lower() or "oblique" in font.lower()
 
 
+SUPERSCRIPT_DIGITS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹",
+                                    "0123456789")
+
+
+def as_marker_digits(text):
+    r"""The digits of `text` if it is nothing but digits -- ASCII ("12") or
+    Unicode superscripts ("¹²") -- else None.
+
+    str.isdigit() is True for "¹" (superscript 1), so a superscript
+    marker would pass a naive digit test but get emitted verbatim as
+    "[¹]" -- which FOOTNOTE_MARKER_RE (\d, i.e. Unicode category Nd
+    only) can never match again: the marker could not be counted, restored
+    if translation dropped it, or stripped by the near-empty-paragraph
+    check. Normalizing to ASCII first keeps every downstream [N] consumer
+    working."""
+    stripped = text.strip()
+    if not stripped:
+        return None
+    ascii_digits = stripped.translate(SUPERSCRIPT_DIGITS)
+    if ascii_digits.isdecimal() and len(ascii_digits) <= 3:
+        return ascii_digits
+    return None
+
+
+def span_is_footnote_marker(span, dominant_size):
+    """A footnote reference number: digits-only, and either set smaller than
+    the body text or written with Unicode superscript glyphs (which carry
+    the superscripting in the characters themselves, so they're often set
+    at full body size and would fail a size-only test). Returns the ASCII
+    digit string, or None if this span isn't a marker."""
+    digits = as_marker_digits(span["text"])
+    if digits is None:
+        return None
+    if span["size"] < dominant_size * 0.8 or span["text"].strip() != digits:
+        return digits
+    return None
+
+
+ASTERISK_SENTINEL = ""  # private use area; stands in for a literal "*"
+
+
 def line_text_marking(line, dominant_size):
     """Like line_text, but with two kinds of markup injected as plain-text
     markers so they survive the trip through the translation model:
 
-    - A span whose font is much smaller than the body text and consists
-      only of digits (a footnote reference number set as a separate,
-      smaller-sized span glued directly onto the preceding word) is
-      rewritten as an explicit " [N] " token. Left as raw text, that marker
-      would just get silently absorbed into the adjacent number/word (e.g.
-      "1938" + "1" -> "19381") when spans are naively concatenated.
+    - A footnote-marker span (see span_is_footnote_marker) is rewritten as
+      an explicit " [N] " token. Left as raw text, it would just get
+      silently absorbed into the adjacent number/word (e.g. "1938" + "1" ->
+      "19381") when spans are naively concatenated.
     - An italic span is wrapped in "*...*". TranslateGemma reliably passes
       this markdown-style emphasis through translation intact (verified
       empirically -- it already produces this style on its own for things
       like book titles), which plain italic formatting has no way to
       survive since the model only sees a text string.
+
+    A literal "*" already present in the source (German uses "* 1903" for a
+    birth date, or plain arithmetic like "2 * 4") is indistinguishable from
+    an italic delimiter once spans are flattened to a string, and would get
+    paired with the next one, italicizing everything in between. It's
+    parked on a private-use sentinel that no real text contains and that
+    survives translation as an opaque character, then restored at render
+    time (see text_to_html).
     """
     parts = []
     for s in line["spans"]:
         t = s["text"]
         stripped = t.strip()
-        if (
-            stripped
-            and s["size"] < dominant_size * 0.8
-            and stripped.isdigit()
-            and len(stripped) <= 3
-        ):
-            parts.append(f" [{stripped}] ")
+        marker = span_is_footnote_marker(s, dominant_size) if stripped else None
+        if marker is not None:
+            parts.append(f" [{marker}] ")
         elif stripped and span_is_italic(s):
             lead = t[: len(t) - len(t.lstrip())]
             trail = t[len(t.rstrip()):]
-            parts.append(f"{lead}*{stripped}*{trail}")
+            # A literal "*" inside the span would close this italic run early
+            parts.append(f"{lead}*{stripped.replace('*', ASTERISK_SENTINEL)}*{trail}")
         else:
-            parts.append(t)
+            parts.append(t.replace("*", ASTERISK_SENTINEL))
     return "".join(parts)
 
 
@@ -170,11 +222,26 @@ def join_paragraph_lines(pieces, dehyphenate=True):
         opens_italic = nxt.startswith("*")
         nxt_core = nxt[1:] if opens_italic else nxt
 
-        if not (dehyphenate and core.endswith("-")
-                and len(core) >= 2 and not core[-2].isspace()):
+        at_break_hyphen = (core.endswith("-") and len(core) >= 2
+                           and not core[-2].isspace())
+        if not at_break_hyphen:
             out = out + " " + nxt  # no line-break hyphen at all
         elif _SUSPENSION_RE.match(nxt_core):
-            out = out + " " + nxt  # "Sozial-" + "und ..."
+            # Checked before the dehyphenate branch below: a suspended
+            # compound keeps BOTH its hyphen and the following space in
+            # either mode ("Sozial- und ...", never "Sozial-und ...").
+            out = out + " " + nxt
+        elif not dehyphenate:
+            # Reformat-only mode: the hyphen is always a real character
+            # (insert_htmlbox never hyphenates at a line break the way
+            # German typesetting does, so it's a compound word, a name, or
+            # a page range), so it's kept -- but the two halves are still
+            # one word and must not be separated by a space ("Schulte-" +
+            # "Sasse" is "Schulte-Sasse", never "Schulte- Sasse").
+            if tail and opens_italic:  # "105-"+"109" across an italic boundary
+                out = core + nxt_core  # merge the two runs; "**" would break parsing
+            else:
+                out = core + tail + nxt
         elif nxt_core[:1].islower():  # real word break -> fuse
             if tail and opens_italic:  # ...across an italic boundary
                 out = core[:-1] + nxt_core
@@ -233,9 +300,23 @@ def split_page_into_paragraphs(blocks, left_margin_tolerance=4.0, gap_multiplier
         translate."""
         real_spans = [
             s for s in line["spans"]
-            if not (s["size"] < page_dominant_size * 0.8 and s["text"].strip().isdigit())
+            if span_is_footnote_marker(s, page_dominant_size) is None
         ]
         return dominant_size([{"spans": real_spans}]) if real_spans else None
+
+    def starts_with_marker(line):
+        """True if the line opens with a footnote reference number. Footnote
+        and reference-list entries sit flush at the body margin, in the same
+        size, one after another with normal leading -- none of the indent,
+        size-jump or gap signals fire, so consecutive entries would
+        otherwise be merged into a single paragraph and translated as one
+        run-on blob. The leading marker is the only thing that
+        distinguishes them."""
+        for sp in line["spans"]:
+            if not sp["text"].strip():
+                continue
+            return span_is_footnote_marker(sp, page_dominant_size) is not None
+        return False
 
     paragraphs = []
     current_lines = []
@@ -257,6 +338,7 @@ def split_page_into_paragraphs(blocks, left_margin_tolerance=4.0, gap_multiplier
         same_row = prev_y0 is not None and abs(y0 - prev_y0) < 2.0
         is_new_para = not same_row and (
             x0 > margin + left_margin_tolerance
+            or starts_with_marker(line)
             or (prev_size is not None and size is not None and abs(size - prev_size) > 1.5)
             or (prev_y1 is not None and y0 - prev_y1 > gap_multiplier * (size or page_dominant_size))
         )
@@ -289,7 +371,13 @@ def split_page_into_paragraphs(blocks, left_margin_tolerance=4.0, gap_multiplier
         bbox = fitz.Rect(para_lines[0]["bbox"])
         for l in para_lines[1:]:
             bbox |= fitz.Rect(l["bbox"])
-        size = para_lines[0]["spans"][0]["size"] if para_lines[0]["spans"] else 10.0
+        # The size covering the most characters in the whole paragraph, not
+        # the first span's. A footnote/reference entry starts with its
+        # superscript marker, so the first span is the ~6.5pt marker while
+        # the entry itself is ~9pt -- taking the first span rendered whole
+        # footnote blocks at marker size, and also skewed page_body_size
+        # (which drives the small-text/tight-run checks in process_pdf).
+        size = dominant_size(para_lines) if para_lines[0]["spans"] else 10.0
         font = para_lines[0]["spans"][0]["font"] if para_lines[0]["spans"] else "Times-Roman"
         # a paragraph that was a single line in the source is almost always
         # a heading/title/byline fragment, not real body prose -- justify
@@ -364,31 +452,42 @@ def font_setup():
         + "\nAdd your font directory to FONT_CANDIDATES in translate_pdf.py."
     )
 
-ASTERISK_RUN_RE = re.compile(r"\*(.+?)\*")
+# Markdown-style emphasis: the opening "*" must be followed by non-space and
+# the closing "*" preceded by non-space, and neither may sit inside a word.
+# A bare "*" used as a real character ("2 * 4", "* 1903") therefore never
+# opens a run, unlike the old r"\*(.+?)\*", which paired any two asterisks
+# positionally and would italicize everything between a literal one and the
+# next.
+ASTERISK_RUN_RE = re.compile(r"(?<![\w*])\*(?!\s)([^*]+?)(?<!\s)\*(?![\w*])")
 
 
 def text_to_html(text):
     """Turn a string containing '*italic*' markers into an HTML fragment
-    with <i> tags, escaping everything else. Falls back to plain (all
-    asterisks stripped) if they're unbalanced -- e.g. the translation
-    model dropped one -- rather than risk mis-nesting tags."""
+    with <i> tags, escaping everything else. Any asterisk that doesn't form
+    a well-formed emphasis run (the model dropped one, or it was a literal
+    asterisk to begin with) is dropped rather than risking mis-nested tags
+    -- this used to be an all-or-nothing whole-string parity check, which
+    meant one dropped asterisk anywhere killed italics for the entire
+    paragraph."""
     # TranslateGemma sometimes emits markdown-style "**bold**"; normalize
     # runs of 2+ asterisks to one before parsing, or "**Dialektik**" becomes
     # "<i>*Dialektik</i>*" -- a stray literal "*" plus an italic run that
     # starts one character early.
     text = re.sub(r"\*{2,}", "*", text)
     text = re.sub(r"\*(\s*)\*", r"\1", text)  # drop empty runs left behind
-    if text.count("*") % 2 != 0:
-        text = text.replace("*", "")
-        return html.escape(text)
+
+    def esc(chunk):
+        # Restore literal asterisks parked on the sentinel by
+        # line_text_marking, and drop any leftover unmatched delimiter.
+        return html.escape(chunk.replace("*", "").replace(ASTERISK_SENTINEL, "*"))
 
     out = []
     pos = 0
     for m in ASTERISK_RUN_RE.finditer(text):
-        out.append(html.escape(text[pos:m.start()]))
-        out.append(f"<i>{html.escape(m.group(1))}</i>")
+        out.append(esc(text[pos:m.start()]))
+        out.append(f"<i>{esc(m.group(1))}</i>")
         pos = m.end()
-    out.append(html.escape(text[pos:]))
+    out.append(esc(text[pos:]))
     return "".join(out)
 
 
@@ -423,6 +522,86 @@ def fit_and_insert(page, rect, text, fontsize, single_line=False):
         rect, paragraph_html(text, fontsize, single_line),
         css=css, archive=archive, scale_low=0,
     )
+
+
+MIN_PARA_GAP = 2.0      # smallest gap we will squeeze a paragraph gap down to
+MIN_FIT_SCALE = 0.72    # smallest font scale before we give up and warn
+
+
+def fit_placements_to_page(placements, page_rect, bottom_margin=18.0, report=None):
+    """Squeeze a page's flowing placements back inside the page box.
+
+    Reflow preserves each paragraph's original gap to the next one exactly,
+    which is right, but it has no notion of a page bottom: if the English
+    runs longer than the German, every paragraph below the growth is pushed
+    down, and once a rect passes the bottom of the media box, insert_htmlbox
+    still reports a clean fit (it is only asked whether the text fits the
+    *rect*) and happily draws off-page. The result is content that is
+    silently invisible in the output PDF -- no error, no warning, and the
+    overflow also lands on top of any pinned folio on its way down.
+
+    Two stages, cheapest first:
+      1. Shrink the inter-paragraph gaps (never below MIN_PARA_GAP).
+      2. If that is not enough, scale every flowing paragraph's font down by
+         a uniform factor and re-measure, so the page stays visually
+         consistent rather than having one arbitrary paragraph shrink.
+
+    Pinned placements (folios, running heads) are page-anchored and are left
+    exactly where they are. If even MIN_FIT_SCALE will not fit, the text is
+    laid out at that scale and a warning is reported -- clipped-but-flagged
+    beats silently dropped.
+    """
+    flowing = [p for p in placements if not p["pinned"]]
+    if not flowing:
+        return placements
+    limit = page_rect.y1 - bottom_margin
+    if max(p["rect"].y1 for p in flowing) <= limit:
+        return placements
+
+    top = flowing[0]["rect"].y0
+    gaps = [
+        flowing[i]["rect"].y0 - flowing[i - 1]["rect"].y1
+        for i in range(1, len(flowing))
+    ]
+
+    def lay_out(scale):
+        """Place the paragraphs top-down at `scale`, with gaps shrunk only as
+        far as needed. Returns (rects, sizes, overflow)."""
+        sizes = [p["size"] * scale for p in flowing]
+        heights = [
+            measure_height(p["rect"].width, p["text"], sz, p["single_line"]) + 2
+            for p, sz in zip(flowing, sizes)
+        ]
+        need = sum(heights) + sum(max(g, MIN_PARA_GAP) for g in gaps)
+        avail = limit - top
+        slack = sum(max(0.0, g - MIN_PARA_GAP) for g in gaps)
+        # how much of the original gap slack we can afford to keep
+        keep = 1.0 if slack <= 0 else max(0.0, min(1.0, (avail - need) / slack + 1.0))
+        rects, y = [], top
+        for i, (p, h) in enumerate(zip(flowing, heights)):
+            if i:
+                g = gaps[i - 1]
+                y += MIN_PARA_GAP + max(0.0, g - MIN_PARA_GAP) * keep
+            rects.append(fitz.Rect(p["rect"].x0, y, p["rect"].x1, y + h))
+            y += h
+        return rects, sizes, y - limit
+
+    scale = 1.0
+    while True:
+        rects, sizes, overflow = lay_out(scale)
+        if overflow <= 0 or scale <= MIN_FIT_SCALE:
+            break
+        scale = max(MIN_FIT_SCALE, scale - 0.04)
+
+    if overflow > 0 and report:
+        report(f"  WARNING: page content overflows by {overflow:.0f}pt even at "
+               f"{scale:.2f}x font scale -- some text may be clipped")
+    elif scale < 1.0 and report:
+        report(f"  page content rescaled to {scale:.2f}x to fit the page")
+
+    for p, r, sz in zip(flowing, rects, sizes):
+        p["rect"], p["size"] = r, sz
+    return placements
 
 
 def process_pdf(in_path, out_path, model_name, page_range=None, progress_callback=None,
@@ -522,9 +701,13 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
                     # the original (German) text; insert_htmlbox's font metrics
                     # differ slightly from insert_textbox's, so give short
                     # single-line fragments a little slack to avoid an
-                    # unwanted wrap when the translation is a touch wider
-                    pad = para["size"] * 1.5
-                    x0, x1 = x0 - pad / 2, x1 + pad / 2
+                    # unwanted wrap when the translation is a touch wider.
+                    # The slack is added on the RIGHT only: these boxes are
+                    # left-aligned (single_line -> text-align:left), so
+                    # widening leftwards moved the text itself off the body
+                    # margin (a 14pt heading drifted 10.5pt left of the
+                    # column it should line up with).
+                    x1 = min(x1 + para["size"] * 1.5, page.rect.x1 - 2)
                 width = x1 - x0
                 size = para["size"]
                 is_small_text = page_body_size > 0 and size < page_body_size * 0.9
@@ -547,10 +730,11 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
                     # the entry after it).
                     new_y0 = para["bbox"].y0
                     needed_h = measure_height(width, translated, size, single_line)
-                    placements.append((
-                        fitz.Rect(x0, new_y0, x1, new_y0 + needed_h + 2),
-                        translated, size, single_line,
-                    ))
+                    placements.append({
+                        "rect": fitz.Rect(x0, new_y0, x1, new_y0 + needed_h + 2),
+                        "text": translated, "size": size,
+                        "single_line": single_line, "pinned": True,
+                    })
                     return
                 if prev_new_y1 is None:
                     new_y0 = para["bbox"].y0  # first paragraph on the page: keep as-is
@@ -573,7 +757,10 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
                 prev_new_y1 = insert_bbox.y1
                 prev_was_small_text = is_small_text
                 prev_was_short = is_short
-                placements.append((insert_bbox, translated, size, single_line))
+                placements.append({
+                    "rect": insert_bbox, "text": translated, "size": size,
+                    "single_line": single_line, "pinned": False,
+                })
 
             for para in paragraphs:
                 text = para["text"].strip()
@@ -612,11 +799,13 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
                 report(f"  page {pno + 1}: paragraph translated ({len(text)} -> {len(translated)} chars)")
                 place(para, translated, para["single_line"])
 
+            fit_placements_to_page(placements, page.rect, report=report)
+
             if page_redact_bbox is not None:
                 # cover the whole original text footprint, plus any net growth,
                 # in one shot so no leftover German can peek through a shift
                 if placements:
-                    last_bottom = max(p[0].y1 for p in placements)
+                    last_bottom = max(p["rect"].y1 for p in placements)
                     page_redact_bbox.y1 = max(page_redact_bbox.y1, last_bottom + 2)
                 page.add_redact_annot(page_redact_bbox, fill=(1, 1, 1))
                 # Only the text is being replaced. The default
@@ -628,8 +817,8 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
                     graphics=fitz.PDF_REDACT_LINE_ART_NONE,
                 )
 
-            for insert_bbox, translated, size, single_line in placements:
-                fit_and_insert(page, insert_bbox, translated, size, single_line)
+            for p in placements:
+                fit_and_insert(page, p["rect"], p["text"], p["size"], p["single_line"])
 
         # Each insert_htmlbox call embeds its own font subset rather than
         # reusing one already embedded on the page -- across a whole document
