@@ -1,9 +1,266 @@
-# auto-translate-pdf — audit & fix history
+# auto-translate-pdf — pipeline overview & audit/fix history
+
+This is the detailed technical record of the whole project: what the
+pipeline does and how it works end to end, plus everything three rounds of
+external audit found and how each fix was verified. `README.md` carries a
+shorter version of the pipeline mechanics for a first-time reader; this file
+is the fuller reference.
+
+---
+
+## What this is
+
+A local, offline German → English PDF translator. Drop a PDF in, get back
+`<name>_en.pdf` with the same layout — paragraph structure, headers/footers,
+footnote reference numbers, and italics (book titles, emphasis) all carried
+over, not just a flat text dump.
+
+Everything runs on-device: translation is done by
+[TranslateGemma 4B](https://huggingface.co/google/translategemma-4b-it)
+(Google's Gemma 3 fine-tuned for translation), running locally via
+[`mlx-lm`](https://github.com/ml-explore/mlx-lm) on Apple Silicon. No API
+keys, no cloud calls, no per-page cost. `colab_translate.ipynb` in this repo
+runs the same pipeline on a free Colab GPU instead, via `transformers` + 4-bit
+`bitsandbytes`, for anyone without Apple Silicon handy — same model family,
+same chat-template format, just a different `generate()` call and no Folder
+Action (that part's macOS-only).
+
+## Setup
+
+```bash
+git clone https://github.com/materialcritic/auto-translate-pdf.git
+cd auto-translate-pdf
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+```
+
+The model (`mlx-community/translategemma-4b-it-4bit`, ~2.1 GB) downloads once
+on first run and is cached under `~/.cache/huggingface/hub/` — no re-download
+on subsequent runs.
+
+### Standalone usage
+
+```bash
+./venv/bin/python translate_pdf.py input.pdf output.pdf [--pages 1-5]
+```
+
+### Folder-watch usage (macOS Folder Action)
+
+`scripts/auto_translate_pdf.py` watches a folder (`~/Translate` by default —
+edit `FOLDER` at the top of the script to change it) and translates any PDF
+dropped there, hands-off. It's designed to be triggered by a macOS Folder
+Action:
+
+1. In Automator, create a new "Folder Action" workflow attached to your
+   watched folder, with a single "Run Shell Script" (`/bin/zsh`) action
+   running:
+   ```
+   /path/to/auto-translate-pdf/venv/bin/python3 /path/to/auto-translate-pdf/scripts/auto_translate_pdf.py
+   ```
+2. Save the workflow, then attach it to the folder (Folder Actions run when
+   Finder detects a new item added to the attached folder — this also fires
+   for files added via a script or `cp`, not just drag-and-drop).
+
+It's also safe to just run the script directly, or on a cron — it only
+touches files it hasn't successfully translated before (tracked in a
+`.auto_translate_state.json` file inside the watched folder, keyed on each
+file's path *and* size/mtime — see Finding 10 below — so replacing a file
+under the same name gets picked up rather than skipped forever), and a lock
+file keeps concurrent triggers from racing each other or double-loading the
+model. `wait_until_stable()` also holds off on a file until its size has
+stopped changing for a couple of polls, since a Folder Action fires on "item
+added," which for a large or network-copied file can precede the last byte
+actually landing.
+
+## How the translation pipeline works (`translate_pdf.py`)
+
+1. **Extract** text blocks per page with PyMuPDF, keeping bbox + font info
+   for every span.
+2. **Split into paragraphs.** `split_page_into_paragraphs` groups a page's
+   lines using indentation as the primary signal — how justified academic
+   body text is laid out: no blank line between paragraphs, just an indented
+   first line. This runs across *all* of a page's lines flattened together,
+   not block by block: some PDF producers group a whole paragraph into one
+   PDF "block" (block-level detection would suffice there), but others emit
+   one block per line, in which case per-block detection can never see a
+   previous line to compare indentation against, and every line would be
+   mistaken for its own paragraph — destroying sentence structure at every
+   mid-sentence line break. Flattening first makes the two cases
+   indistinguishable, which is what's wanted.
+
+   Several more signals guard against merging things that just happen to
+   share the body margin, or splitting things that shouldn't be split:
+   - A large font-size jump forces a paragraph break (a heading dropped into
+     body text shouldn't get swallowed into the surrounding paragraph) —
+     computed while ignoring footnote-marker spans specifically, since a
+     line consisting only of a trailing footnote marker would otherwise
+     report that marker's tiny font size as a spurious size jump and get
+     sliced into its own degenerate one-token "paragraph."
+   - Lines at (almost) the same y-coordinate as the previous line are always
+     treated as the same physical line continuing, regardless of x0/size.
+     Some PDFs (justified text with unusually wide word-cluster gaps) get
+     split by PyMuPDF into several "line" dict entries that are really one
+     visual line — without this guard, each word cluster's x0 would look
+     like an indent and shatter the line into one-word "paragraphs"
+     translated in isolation, scrambling the sentence.
+   - A line that *opens* with a footnote reference marker also forces a new
+     paragraph — footnote/reference-list entries sit flush at the body
+     margin, same size, one after another with normal line spacing, so none
+     of the other signals fire between consecutive entries; without this,
+     a whole block of footnotes gets merged and translated as one run-on
+     blob.
+3. **Mark up inline formatting as plain-text tokens.** A translation model
+   only ever sees a flat string, so any real character-level formatting has
+   to survive as literal characters or it's lost:
+   - A footnote reference number (a separate, smaller-font span glued
+     directly onto the preceding word, e.g. "1938" + superscript "1") is
+     rewritten as an explicit `[1]` token — otherwise it gets silently
+     absorbed into the adjacent number (`"19381"`) and becomes
+     unrecoverable. Unicode superscript digits (¹²³...) are normalized to
+     ASCII first, since a raw `[¹]` could never be matched by the regex that
+     looks for it again later.
+   - An italic span is wrapped in `*asterisks*`. TranslateGemma reliably
+     passes this markdown-style emphasis through translation intact
+     (confirmed empirically — it already produces this style on its own for
+     things like book titles). A literal `*` already present in the source
+     (German uses `* 1903` for a birth date; plain arithmetic like `2 * 4`
+     also occurs) would otherwise be indistinguishable from an italic
+     delimiter once spans are flattened to a string, so it's parked on a
+     private-use Unicode sentinel first and restored to a literal `*` only
+     at render time.
+4. **Translate** each paragraph with TranslateGemma via `mlx_lm.generate`.
+   TranslateGemma's chat template requires a specific structured message
+   format (`{"type": "text", "source_lang_code": "de", "target_lang_code":
+   "en", "text": ...}`) — it does not accept a system prompt or free-form
+   instructions, unlike a general chat model.
+5. **Recover anything the model dropped.** If a `[N]` footnote marker didn't
+   survive translation verbatim, it's appended at the end of the paragraph
+   rather than silently lost (imperfect placement, but nothing disappears —
+   and this check is count-aware, so a paragraph carrying `[1]` twice only
+   treats it as complete if *both* survived). Separately, a paragraph with
+   almost no real text after stripping markers (fewer than 4 characters —
+   e.g. a stray dash, or a footnote marker that still ended up alone despite
+   the paragraph-merge guards above) is never sent to the model at all: a
+   translation request with nothing real to translate risks getting back a
+   confused conversational reply ("please provide the German text...")
+   instead of an actual translation, which would otherwise get inserted into
+   the PDF as if it were real content.
+6. **Reflow page-wide**, not block-by-block. Each paragraph's gap to the
+   *next* one is computed from the original document (`next.y0 - this.y1`)
+   and applied unchanged after the actual rendered bottom of this paragraph
+   (`new_y0 = prev_new_y1 + original_gap`) — so a paragraph that translates
+   shorter or longer pushes everything below it up or down, but the spacing
+   it leaves behind matches the original layout's intent exactly, rather
+   than compounding a paragraph's own shrinkage into the gap after it.
+   Page-anchored furniture (folios, running heads — digit-only paragraphs
+   sitting in the top/bottom 12% margin band of the page) is *pinned*
+   instead: kept at its original position and excluded from this chain
+   entirely, since a folio is anchored to the page, not to the text flow,
+   and would otherwise inherit the body's accumulated shift (or, worse, if
+   it's the first paragraph on the page, *become* the chain's anchor and
+   drag the entire body up or down with it).
+7. **Clamp to the page.** `fit_placements_to_page` runs after every
+   paragraph on a page has been placed, and before redaction: if the
+   English runs long enough that the flowing placements would extend past
+   the page bottom, it first shrinks the inter-paragraph gaps (never below a
+   floor), and if that alone isn't enough, scales every flowing paragraph's
+   font down by one uniform factor (so the page stays visually consistent
+   rather than one arbitrary paragraph shrinking) and re-measures. Pinned
+   placements are left untouched throughout, since they're page-anchored,
+   not flow-anchored. If even the minimum scale won't fit, the text is laid
+   out clipped at that scale and a warning is reported rather than the
+   overflow simply vanishing off-page with no error at all.
+8. **Redact and re-insert.** The original page's entire text footprint is
+   redacted in one shot (scoped to text only — `PDF_REDACT_IMAGE_NONE` /
+   `PDF_REDACT_LINE_ART_NONE`, so embedded images/figures on the page
+   survive untouched), then the English text is re-inserted via
+   `page.insert_htmlbox()` (not the simpler `insert_textbox`) so that
+   `*italic*` markers can become real `<i>` runs, using an embedded Times
+   New Roman + Times New Roman Italic (via `fitz.Archive`, built lazily on
+   first use with a fallback list of font locations) — PyMuPDF's built-in
+   base-14 fonts only cover a narrow glyph set and silently render smart
+   quotes/em dashes as `?`.
+9. **Save.** `garbage=4, deflate=True` finds and merges duplicate embedded
+   font objects — without it, each `insert_htmlbox` call embeds its own font
+   subset rather than reusing one already on the page, which across a
+   41-page document produced 1,143 duplicate font objects and ballooned a
+   file that should be ~1MB into ~950MB. Saved to a `.part` temp name and
+   renamed on success, so a mid-run failure never leaves a corrupt or
+   partial file where the watcher's `out.exists()` check would mistake it
+   for a completed translation.
+
+## Reformat-only mode (fix layout without re-translating)
+
+`process_pdf(in_path, out_path, model_name, skip_translation=True)`
+(or `translate_pdf.py ... --reformat-only` from the CLI) re-reads an
+*already-English* PDF this script produced and re-runs only the
+extraction/reflow/rendering steps — no model load, no translation calls. Use
+this for a pure formatting fix on an existing output (e.g. after a
+rendering-bug fix lands, to fix a file translated before the fix without
+paying for a fresh translation, which would also introduce fresh
+non-determinism into text that was already correct):
+
+```python
+import sys; sys.path.insert(0, ".")
+from translate_pdf import process_pdf
+process_pdf("in_en.pdf", "out_en.pdf", None, skip_translation=True)
+```
+
+Two things only matter in this mode:
+- `dehyphenate` is forced off. `insert_htmlbox` never hyphenates at a real
+  line break the way German typesetting does, so a "-" in re-extracted text
+  is always a real character (a compound word, a name, a page range) — the
+  normal de-hyphenation rule would wrongly delete it. Reformat mode instead
+  keeps the hyphen and joins the two halves without inserting a space.
+- Consecutive paragraphs identified as "tight" (either both smaller than the
+  page's largest font size, i.e. a footnote/reference-list run, or both
+  short — under 120 characters, catching title/subtitle fragments and
+  citation-metadata lines) get a fixed 3pt gap instead of the gap preserved
+  from the input file, since in this mode "the original gap" just means
+  whatever's already baked into the file being reformatted — for these runs
+  that can be exactly the oversized/compounding gap a fix is meant to
+  correct, not a genuine layout intent to preserve.
+
+## Known limitations
+
+- **Very short italic phrases** (2-3 words) occasionally lose the `*...*`
+  marker during translation and render as plain text — content is never
+  lost, just the emphasis styling on that one phrase.
+- **A hyphenated word split across a line break can leave a residual
+  fragment** in a paragraph-merge edge case not yet covered (the common
+  case, including hyphenation across an italic-run boundary, is handled) —
+  this is heuristic-based extraction from arbitrary PDF layouts, not a
+  guarantee against every possible producer quirk. Spot-check unfamiliar
+  documents' output, especially around footnotes and section breaks.
+- **Translation quality** depends entirely on TranslateGemma 4B. It reads as
+  fluent, idiomatic English on academic German prose, but isn't a substitute
+  for professional translation of anything high-stakes.
+- **Only handles single-column, prose-heavy layouts well.** No table
+  support, no multi-column layout support. Embedded images/figures are left
+  untouched but aren't captioned or otherwise processed.
+- Assumes German → English. There's no language auto-detection; dropping a
+  non-German PDF will still run it through the DE→EN model.
+- Each run loads a ~2 GB model into memory — a full 14-page document took
+  about 7 minutes end-to-end on a base M1 Air; a 40-page document took ~49
+  minutes on the same machine under memory pressure from other running
+  apps. Dropping several PDFs in quick succession queues them (via a lock
+  file) rather than running translations in parallel, so as not to fight
+  over memory/model reloads.
+
+## License
+
+MIT for the code in this repo. The model it downloads and runs
+(`mlx-community/translategemma-4b-it-4bit`, derived from Google's Gemma 3) is
+distributed separately under its own
+[Gemma license terms](https://ai.google.dev/gemma/terms).
+
+---
+
+# Audit & fix history
 
 Three rounds of external audit have been run against this pipeline since the
-initial publish. This file is the detailed record of what each one found,
-what was actually fixed, and how each fix was verified. It complements the
-brief "Change history" sections already in `README.md`.
+initial publish. What follows is the detailed record of what each one found,
+what was actually fixed, and how each fix was verified.
 
 ---
 
