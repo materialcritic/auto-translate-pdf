@@ -180,6 +180,43 @@ with tempfile.TemporaryDirectory() as d:
               any("deutscher" in "".join(s["text"] for s in l["spans"]) for l in lines))
 
 
+# --- A multi-column page must not abort the whole document: one flagged
+# --- page should be skipped (left untranslated), not lose every other
+# --- page's already-finished work. ---
+
+tp.translate = lambda m, t, txt, temp=0.0, report=None: "TRANSLATED: " + txt
+
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    fx, out = d / "in.pdf", d / "out.pdf"
+    doc = fitz.open()
+    p1 = doc.new_page(width=400, height=400)
+    p1.insert_text((72, 72), "Ein guter einspaltiger deutscher Satz hier drin.", fontsize=10)
+    p2 = doc.new_page(width=600, height=400)  # two-column, like a TOC/index page
+    for i, y in enumerate(range(72, 300, 14)):
+        p2.insert_text((72, y), f"Linke Spalte Zeile {i}.", fontsize=10)
+        p2.insert_text((320, y), f"Rechte Spalte Zeile {i}.", fontsize=10)
+    p3 = doc.new_page(width=400, height=400)
+    p3.insert_text((72, 72), "Noch ein guter einspaltiger deutscher Satz hier.", fontsize=10)
+    doc.save(str(fx))
+    doc.close()
+
+    tp.process_pdf(str(fx), str(out), "stub")
+    o = fitz.open(str(out))
+    check("multi-column: document still saved with all 3 pages "
+          "(one flagged page must not abort the whole document)",
+          len(o) == 3, len(o))
+    page1_text, page2_text, page3_text = (o[i].get_text() for i in range(3))
+    o.close()
+    check("multi-column: page 1 (fine, single-column) was translated",
+          "TRANSLATED:" in page1_text, page1_text)
+    check("multi-column: page 2 (flagged multi-column) was left untranslated, not force-scrambled",
+          "TRANSLATED:" not in page2_text and "Linke Spalte" in page2_text, page2_text)
+    check("multi-column: page 3 (fine, single-column) was translated too "
+          "(not just the pages before the flagged one)",
+          "TRANSLATED:" in page3_text, page3_text)
+
+
 print()
 if failures:
     print(f"{len(failures)} check(s) FAILED: {', '.join(failures)}")

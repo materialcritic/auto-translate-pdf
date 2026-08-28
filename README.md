@@ -241,8 +241,9 @@ non-zero if anything fails.
 - **Only handles single-column, prose-heavy layouts well.** No table
   support, no multi-column reflow support (a two-column page is now
   *detected* — `--check` and `process_pdf` both warn, and `process_pdf`
-  refuses to translate a detected multi-column page unless `--force` is
-  passed — but there's no column-aware reflow, so `--force`ing one through
+  leaves a detected multi-column page untranslated by default, translating
+  every other page in the document normally; pass `--force` to translate it
+  anyway — but there's no column-aware reflow, so `--force`ing one through
   still zips the columns together into one scrambled paragraph). Embedded
   images/figures are left untouched (the page-wide text redaction
   explicitly excludes them) but aren't captioned or otherwise processed.

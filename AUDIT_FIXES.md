@@ -924,3 +924,55 @@ fixed by code inspection/reasoning only (6, 9 -- both are in the
 mlx-lm/model-generation path, which needs real Apple Silicon hardware to
 verify against the actual model; unavailable in this environment). Nothing
 from this round was skipped or left as won't-fix.
+
+---
+
+## Post-Round-4 self-review — 2 findings
+
+A self-review pass over the Round 4 diff (no external audit; the code was
+re-read fresh looking for bugs introduced by that round's own fixes) turned
+up two real issues, both in `translate_pdf.py`.
+
+### A. A single multi-column page aborted the *entire* document — Fixed + verified
+
+Finding 8's fix raised `UnsupportedInputError` from inside the per-page
+loop when a page looked multi-column and `--force` wasn't given. But
+`doc.save()` only runs after that loop completes normally -- raising
+partway through discards every other page's already-finished translation
+too. A 200-page book with one two-column index or table-of-contents page
+(common) would fail to produce *any* output at all unless `--force` was
+passed for the whole document, which then also disables the safety net for
+any genuinely-scrambling multi-column body pages elsewhere in the same
+file.
+
+**Fix:** a flagged page is now skipped (left untranslated, with a warning)
+via `continue` rather than raising -- every other page in the document is
+still translated normally. `--force` still means "translate this page
+anyway" for a page that reaches this check. Updated the `process_pdf`
+docstring, `--force`'s CLI help text, and `check_pdf`'s warning wording to
+match ("this page will be left untranslated" rather than "output will be
+scrambled").
+
+**Verified:** a 3-page synthetic document (pages 1 and 3 fine single-column
+German, page 2 a two-column layout) now saves all 3 pages, with pages 1 and
+3 translated and page 2 left in German -- confirmed the test fails against
+the old raise-based behavior (an uncaught `UnsupportedInputError` crashes
+the whole `process_pdf` call) and passes against the fix, added as a
+permanent case in `tests/test_layout.py`.
+
+### B. The "--pages" notice printed in `--check` mode, where nothing is translated or copied — Fixed + verified
+
+Round 4 Finding 21's `translating N of M page(s); the remaining K page(s)
+are copied through untranslated` notice was printed unconditionally after
+parsing `--pages`, before the `if args.check:` branch -- so `--check
+--pages 1-5` on a 10-page document printed a translation notice for a run
+that translates nothing at all.
+
+**Fix:** moved the notice after the `--check` early-return, and split its
+wording for `--reformat-only` ("reformatting... copied through as-is")
+vs. normal translation ("translating... copied through untranslated"),
+since reformat-only mode was never translating those pages to begin with.
+
+**Verified:** `translate_pdf.py in.pdf --check --pages 1-5` on a
+multi-page document no longer prints the notice; `--reformat-only --pages
+1-5` prints the reformat-specific wording.

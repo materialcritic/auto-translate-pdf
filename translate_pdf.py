@@ -934,10 +934,12 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
     wasteful or would introduce fresh non-determinism into text that's
     already correct.
 
-    force=True proceeds anyway on a page detected as multi-column (see
-    detect_columns) instead of raising -- the pipeline has no multi-column
-    support, so by default it refuses to silently produce a scrambled
-    interleaved-column translation."""
+    force=True translates a page detected as multi-column (see
+    detect_columns) instead of skipping it -- the pipeline has no
+    multi-column support, so by default such a page is left untranslated
+    (with a warning) rather than silently producing a scrambled
+    interleaved-column translation; every other page in the document is
+    still processed normally either way."""
     def report(line):
         # Always visible on stderr -- this is the only place a real overflow
         # warning (fit_placements_to_page) or a skipped-near-empty-paragraph
@@ -981,9 +983,17 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
                        "top-to-bottom stream, so columns will be zipped together "
                        "row by row into scrambled, fluent-sounding nonsense")
                 if not force:
-                    raise UnsupportedInputError(
-                        f"{msg} (pass force=True / --force to translate anyway)"
-                    )
+                    # Skip just this page rather than raising: a book with
+                    # one two-column index/TOC page and 200 fine single-
+                    # column pages is common, and raising here used to
+                    # abort the *entire* process_pdf call -- doc.save()
+                    # only runs after the page loop completes normally, so
+                    # every other page's already-finished work was silently
+                    # discarded too, over one flagged page. --force is still
+                    # the escape hatch for "translate this page anyway."
+                    report(f"  WARNING: {msg} -- SKIPPING this page "
+                           "untranslated (pass --force to translate it anyway)")
+                    continue
                 report(f"  WARNING: {msg}")
 
             # paragraphs are detected across the whole page's lines at once (see
@@ -1335,8 +1345,9 @@ def check_pdf(in_path, page_range=None, report=print):
                 # --check's own purpose (sanity-checking an unfamiliar
                 # document before a slow, model-backed run) exists to avoid.
                 report(f"  WARNING: page {stats['page']} looks like a "
-                       f"{n_cols}-column layout -- output will be scrambled "
-                       "without --force (no multi-column support)")
+                       f"{n_cols}-column layout -- this page will be left "
+                       "untranslated unless --force is passed (no "
+                       "multi-column support)")
         return all_stats
     finally:
         doc.close()
@@ -1362,9 +1373,9 @@ def main(argv=None):
                           "or writing any output (see 'Sanity-checking a document' "
                           "in the README)")
     ap.add_argument("--force", action="store_true",
-                     help="translate anyway if a page looks multi-column, instead "
-                          "of refusing (there is no multi-column support; output "
-                          "will interleave the columns)")
+                     help="translate a page detected as multi-column instead of "
+                          "leaving it untranslated (there is no multi-column "
+                          "support; its output will interleave the columns)")
     ap.add_argument("--temp", type=float, default=DEFAULT_TEMP,
                      help=f"sampling temperature (default {DEFAULT_TEMP} = "
                           "deterministic; translation is a one-right-answer task, "
@@ -1386,15 +1397,24 @@ def main(argv=None):
     except ValueError as e:
         ap.error(str(e))
 
-    if page_range is not None and len(page_range) < npages:
-        skipped = npages - len(page_range)
-        print(f"translating {len(page_range)} of {npages} page(s); "
-              f"the remaining {skipped} page(s) are copied through untranslated",
-              file=sys.stderr)
-
     if args.check:
         check_pdf(args.input, page_range)
         return
+
+    if page_range is not None and len(page_range) < npages:
+        # Only meaningful once we know we're actually about to
+        # translate/reformat something -- printed unconditionally here
+        # used to also fire for --check, where nothing is translated *or*
+        # copied and the message was simply wrong.
+        skipped = npages - len(page_range)
+        if args.reformat_only:
+            print(f"reformatting {len(page_range)} of {npages} page(s); "
+                  f"the remaining {skipped} page(s) are copied through as-is",
+                  file=sys.stderr)
+        else:
+            print(f"translating {len(page_range)} of {npages} page(s); "
+                  f"the remaining {skipped} page(s) are copied through untranslated",
+                  file=sys.stderr)
 
     if not args.output:
         ap.error("output is required unless --check is given")
