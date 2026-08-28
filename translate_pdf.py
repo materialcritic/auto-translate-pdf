@@ -86,6 +86,8 @@ def load_model(model_name, seed=DEFAULT_SEED):
 
 
 _SENTENCE_END_RE = re.compile(r'[.!?"\')\]]\s*$')
+CHARS_PER_TOKEN = 4          # rough English average; only used if tokenizer.encode(out) fails
+TRUNCATION_BUDGET_FRAC = 0.9  # only suspect truncation once near the token cap, not merely over half of it
 
 
 def translate(model, tokenizer, german_text, temp=DEFAULT_TEMP, report=None):
@@ -155,14 +157,30 @@ def translate(model, tokenizer, german_text, temp=DEFAULT_TEMP, report=None):
     # mlx_lm.generate's plain-string return doesn't expose a finish reason,
     # so approximate "did this hit the token budget" by checking whether the
     # output ends in sentence-final punctuation when the source did, and is
-    # already using most of the character budget the token cap implies (a
-    # short, legitimately unpunctuated fragment shouldn't false-alarm).
-    if (report and _SENTENCE_END_RE.search(german_text.strip())
-            and not _SENTENCE_END_RE.search(out)
-            and len(out) > max_tokens * 2):
-        report(f"  WARNING: translation may be truncated at max_tokens="
-               f"{max_tokens} (source ended in punctuation, output did not): "
-               f"...{out[-60:]!r}")
+    # already using most of max_tokens (a short, legitimately unpunctuated
+    # fragment shouldn't false-alarm). Count the output's own *tokens*
+    # directly via the same tokenizer rather than estimating from character
+    # count against a token budget -- comparing len(out) (characters)
+    # against max_tokens (tokens) via a fixed multiplier either over- or
+    # under-fires depending how well that multiplier matches the real
+    # chars-per-token ratio for whatever text actually came back; encoding
+    # the real output removes the estimate entirely.
+    if report and _SENTENCE_END_RE.search(german_text.strip()) and not _SENTENCE_END_RE.search(out):
+        try:
+            n_out = len(tokenizer.encode(out))
+        except Exception:
+            n_out = None
+        near_budget = (n_out is not None and n_out > max_tokens * TRUNCATION_BUDGET_FRAC)
+        if n_out is None:
+            # encode() unavailable for some reason -- fall back to the
+            # character-count estimate rather than skipping the check
+            # entirely, at CHARS_PER_TOKEN chars/token (a rough English
+            # average).
+            near_budget = len(out) > max_tokens * CHARS_PER_TOKEN * TRUNCATION_BUDGET_FRAC
+        if near_budget:
+            report(f"  WARNING: translation may be truncated at max_tokens="
+                   f"{max_tokens} (source ended in punctuation, output did not): "
+                   f"...{out[-60:]!r}")
     return out
 
 
@@ -213,14 +231,30 @@ def as_marker_digits(text):
 
 def span_is_footnote_marker(span, dominant_size):
     """A footnote reference number: digits-only, and either set smaller than
-    the body text or written with Unicode superscript glyphs (which carry
-    the superscripting in the characters themselves, so they're often set
-    at full body size and would fail a size-only test). Returns the ASCII
-    digit string, or None if this span isn't a marker."""
+    the body text, written with Unicode superscript glyphs (which carry the
+    superscripting in the characters themselves, so they're often set at
+    full body size and would fail a size-only test), or flagged as a real
+    PDF superscript by the typesetter -- which commonly lands at ~0.83x
+    body size, in the dead zone between "small enough to catch on size
+    alone" and "full body size" that the first two checks leave uncovered.
+    PyMuPDF sets bit 0 of a span's `flags` for superscript text; nothing
+    used to ask it. Returns the ASCII digit string, or None if this span
+    isn't a marker."""
     digits = as_marker_digits(span["text"])
     if digits is None:
         return None
-    if span["size"] < dominant_size * 0.8 or span["text"].strip() != digits:
+    is_superscript = bool(span.get("flags", 0) & 1)  # PyMuPDF: bit 0 = superscript
+    if span["size"] < dominant_size * 0.8 or span["text"].strip() != digits or is_superscript:
+        # NOTE: this now also matches a genuine mathematical superscript
+        # exponent ("x<sup>2</sup>", "10<sup>6</sup>") -- also digits-only,
+        # also flagged superscript. Left permissive rather than requiring
+        # "glued to the end of a word/number" (no preceding space) because
+        # the near-empty guard and the "[N]" round trip make the
+        # consequence cosmetic (a wrongly-marked exponent still survives
+        # translation, just wrapped as "[2]" instead of rendered as a
+        # literal superscript "2") rather than corrupting -- unlike a real
+        # marker going undetected, which silently fuses into the adjacent
+        # digits (see this function's docstring / Round 5 Finding 1).
         return digits
     return None
 
@@ -420,6 +454,13 @@ def split_page_into_paragraphs(blocks, left_margin_tolerance=4.0, gap_multiplier
     share the body margin: a large jump in font size (heading dropped into
     the middle of body text) or an unusually large vertical gap (more than
     `gap_multiplier` line-heights) each also force a new paragraph.
+
+    Deliberately doesn't record the source's typeface: every paragraph
+    renders in whichever single serif roman+italic pair font_setup()
+    resolves, regardless of the source document's actual font(s) -- a
+    defensible choice for this project's target document class (academic
+    prose is reliably one serif family throughout), but see "Known
+    limitations" in README.md.
     """
     lines = [l for b in blocks for l in b["lines"] if l["spans"]]
     if not lines:
@@ -531,7 +572,6 @@ def split_page_into_paragraphs(blocks, left_margin_tolerance=4.0, gap_multiplier
         # footnote blocks at marker size, and also skewed page_body_size
         # (which drives the small-text/tight-run checks in process_pdf).
         size = dominant_size(para_lines) if para_lines[0]["spans"] else FALLBACK_FONT_SIZE
-        font = para_lines[0]["spans"][0]["font"] if para_lines[0]["spans"] else FALLBACK_FONT_NAME
         # a paragraph that was a single line in the source is almost always
         # a heading/title/byline fragment, not real body prose -- justify
         # stretches those into ugly full-width letter-spacing if translation
@@ -548,17 +588,66 @@ def split_page_into_paragraphs(blocks, left_margin_tolerance=4.0, gap_multiplier
         # left -- visually one continuous block with no paragraph breaks at
         # all, even though the splitter had correctly found them.
         indent = round(max(0.0, para_lines[0]["bbox"][0] - bbox.x0), 1) if not single_line else 0.0
+        # The source's own line spacing, as a multiple of its font size
+        # (e.g. 1.36 for 15pt leading on 11pt type) rather than an absolute
+        # point value -- paragraph_html emits this straight into CSS's
+        # unitless `line-height`, which is itself already relative to
+        # whatever font-size applies, so a paragraph that later gets
+        # rescaled by fit_placements_to_page keeps the same *proportions*
+        # for free with no extra math. Without this, every paragraph
+        # rendered at MuPDF's user-agent default of 1.2x regardless of the
+        # source's actual leading -- correct only by coincidence for a
+        # document that happened to already be set at 1.2x, and off by as
+        # much as 22% of a paragraph's height for one set looser (a bigger
+        # miss than any of the inter-paragraph gap arithmetic Rounds 1-4
+        # were built to get exactly right). The median of consecutive
+        # line-start deltas (not the mean) so one anomalously large gap --
+        # a widow line before a page break, an accidental double-line-break
+        # in the source -- doesn't skew the whole paragraph's leading.
+        leading_ratio = None
+        if not single_line and size > 0:
+            ys = [l["bbox"][1] for l in para_lines]
+            deltas = sorted(b - a for a, b in zip(ys, ys[1:]) if b > a)
+            if deltas:
+                leading_ratio = round(deltas[len(deltas) // 2] / size, 3)
         result.append({
-            "text": text, "bbox": bbox, "size": size, "font": font,
-            "single_line": single_line, "indent": indent,
+            "text": text, "bbox": bbox, "size": size,
+            "single_line": single_line, "indent": indent, "leading": leading_ratio,
         })
     return result
 
 
-_REFUSAL_RE = re.compile(
-    r"^\s*(please|sorry|i\s+(can|am|cannot|can't))\b|provide\s+the\s+(german\s+)?text",
-    re.I,
-)
+# A refusal opener alone ("please", "sorry", "I can('t)...") is not enough
+# on its own: ordinary German academic prose translates into plenty of
+# legitimate English sentences that start the same way -- an editorial note
+# ("Bitte beachten Sie..." -> "Please note..."), quoted speech ("Es tut mir
+# leid, sagte er..." -> "Sorry, he said..."), first-person argument ("Ich
+# kann diese These nicht teilen..." -> "I cannot share this thesis...").
+# What actually distinguishes a genuine refusal is that it *names the task*
+# -- it talks about providing/translating a text, not about whatever the
+# source's own sentence was about. Requiring the opener to be followed,
+# within a short prefix, by that task-shaped vocabulary ("provide",
+# "translate", "text", "German") cuts the false-positive rate on ordinary
+# prose far more than gating on the source's own language would: a source
+# that itself opens with "Bitte..." for an unrelated reason (the common
+# case) still translates into an opener-only sentence with no task
+# vocabulary and is correctly left unflagged, while a source that happens
+# to itself be phrased as a meta request ("Bitte geben Sie den Text an.")
+# is correctly still flagged, which gating on the source's own opening
+# words would incorrectly suppress.
+_REFUSAL_OPENER_RE = re.compile(r"^\s*(please|sorry|i\s+(?:can|am|cannot|can't))\b", re.I)
+_REFUSAL_TASK_RE = re.compile(r"\b(provide|translat\w*|\btext\b|german)\b", re.I)
+_REFUSAL_PREFIX_CHARS = 80  # how far into the output to look for task vocabulary
+
+
+def looks_like_refusal(translated_text):
+    """True if `translated_text` looks like a conversational refusal
+    ("Please provide the German text you would like translated.") rather
+    than an actual translation. See the module-level comment above for why
+    an opener alone isn't sufficient."""
+    if not _REFUSAL_OPENER_RE.match(translated_text):
+        return False
+    return bool(_REFUSAL_TASK_RE.search(translated_text[:_REFUSAL_PREFIX_CHARS]))
 
 
 def bad_translation_reason(text, translated):
@@ -573,11 +662,11 @@ def bad_translation_reason(text, translated):
     t, out = text.strip(), translated.strip()
     if len(t) > 40 and out == t:
         return "output is identical to the source (probable no-op/echo)"
-    if len(out) < 0.35 * len(t):
+    if len(t) > 40 and len(out) < 0.35 * len(t):
         return "output is much shorter than the source (probable truncation)"
-    if len(out) > 3.0 * len(t):
+    if len(t) > 40 and len(out) > 3.0 * len(t):
         return "output is much longer than the source (probable runaway repetition)"
-    if _REFUSAL_RE.match(out):
+    if looks_like_refusal(out):
         return "output looks like a conversational reply, not a translation"
     return None
 
@@ -699,7 +788,7 @@ def text_to_html(text):
     return "".join(out)
 
 
-def paragraph_html(text, fontsize, single_line=False, indent=0.0):
+def paragraph_html(text, fontsize, single_line=False, indent=0.0, leading=None):
     body = text_to_html(text)
     align = "left" if single_line else "justify"
     # Re-emits the source's first-line indent (see split_page_into_
@@ -710,7 +799,15 @@ def paragraph_html(text, fontsize, single_line=False, indent=0.0):
     # continuous block in the output. Single-line paragraphs are headings/
     # bylines, not indented body prose, so indent is always 0 for those.
     indent_style = f" text-indent:{indent}pt;" if indent else ""
-    return f'<p style="font-size:{fontsize}pt; text-align:{align};{indent_style}">{body}</p>'
+    # Re-emits the source's own line spacing as a multiple of font size
+    # (see split_page_into_paragraphs) -- CSS's unitless line-height is
+    # itself relative to whatever font-size applies, so this stays correct
+    # for free through fit_placements_to_page's rescale with no extra math
+    # on this end. Without it, MuPDF's user-agent default of 1.2x applied
+    # regardless of the source's actual leading.
+    leading_style = f" line-height:{leading};" if leading else ""
+    return (f'<p style="font-size:{fontsize}pt; text-align:{align};'
+            f'{indent_style}{leading_style}">{body}</p>')
 
 
 _SCRATCH_DOC = None
@@ -730,28 +827,56 @@ def _scratch_page(width, height=3000):
     return _SCRATCH_DOC.new_page(width=width + 1, height=height)
 
 
-def _measure_height_uncached(width, text, fontsize, single_line, indent):
+def _measure_height_uncached(width, text, fontsize, single_line, indent, leading):
     archive, css = font_setup()
     page = _scratch_page(width)
     try:
         rect = fitz.Rect(0, 0, width, 3000)
         spare_height, _ = page.insert_htmlbox(
-            rect, paragraph_html(text, fontsize, single_line, indent),
+            rect, paragraph_html(text, fontsize, single_line, indent, leading),
             css=css, archive=archive,
         )
-        return 3000 if spare_height < 0 else 3000 - spare_height
+        box_height = 3000 if spare_height < 0 else 3000 - spare_height
+        # CSS's line-box model reserves some space above the first line's
+        # cap-height and below the last line's descender beyond the glyphs
+        # themselves (bigger for a looser leading) -- box_height (what
+        # insert_htmlbox actually used) is a few points taller than the
+        # *glyph-tight* extent get_text("dict") reports back on
+        # re-extraction. Round 5 Finding 3: using box_height to advance the
+        # reflow chain's "where does the next paragraph start" anchor
+        # planted that few-point gap where reformat-only mode's *next* pass
+        # would read it back as part of the "original" inter-paragraph gap
+        # and preserve it -- plus add its own fresh instance of the same
+        # gap on top, forever. Measuring the actual rendered glyph bbox
+        # here keeps the reflow chain anchored to the same tight geometry
+        # a re-extraction will see, so nothing is left to compound.
+        lines = [
+            l for b in page.get_text("dict")["blocks"] if b["type"] == 0
+            for l in b["lines"] if l["spans"]
+        ]
+        tight_height = (max(l["bbox"][3] for l in lines) - min(l["bbox"][1] for l in lines)
+                        if lines else box_height)
+        return box_height, tight_height
     finally:
         _SCRATCH_DOC.delete_page(page.number)
 
 
 @functools.lru_cache(maxsize=4096)
-def _measure_height_cached(width, text, fontsize, single_line, indent):
-    return _measure_height_uncached(width, text, fontsize, single_line, indent)
+def _measure_height_cached(width, text, fontsize, single_line, indent, leading):
+    return _measure_height_uncached(width, text, fontsize, single_line, indent, leading)
 
 
-def measure_height(width, text, fontsize, single_line=False, indent=0.0):
-    """Height (pt) that `text` actually needs at `fontsize` in a box of
-    given width, measured on a throwaway scratch page.
+def measure_height(width, text, fontsize, single_line=False, indent=0.0, leading=None):
+    """(box_height, tight_height) that `text` needs at `fontsize` in a box
+    of given width, measured on a throwaway scratch page.
+
+    `box_height` is what the CSS line-box model actually occupies (safe to
+    build the *insertion* rect from, so nothing clips); `tight_height` is
+    the glyph-only extent get_text("dict") will report back on
+    re-extraction, a few points shorter (see Round 5 Finding 3). Use
+    `tight_height`, not `box_height`, for anything that becomes an anchor
+    the reflow chain measures a *gap* against later -- box_height there
+    compounds every reformat-only pass, forever.
 
     Cached: `place()` calls this once per paragraph, and
     fit_placements_to_page's rescale loop re-measures *every* flowing
@@ -759,24 +884,38 @@ def measure_height(width, text, fontsize, single_line=False, indent=0.0):
     MIN_FIT_SCALE in 0.04 steps) -- the same (width, text, fontsize)
     triples recur constantly across that loop and across reformat-only
     mode's paragraph-by-paragraph pass, where measurement is pure overhead
-    with no model call to dominate it. Rounding width/fontsize/indent to a
-    fixed precision before hitting the cache trades a little measurement
-    precision (well under a point) for a much higher hit rate than exact
-    float equality would give."""
+    with no model call to dominate it. Rounding width/fontsize/indent/
+    leading to a fixed precision before hitting the cache trades a little
+    measurement precision (well under a point) for a much higher hit rate
+    than exact float equality would give."""
     return _measure_height_cached(
-        round(width, 1), text, round(fontsize, 2), single_line, round(indent, 1)
+        round(width, 1), text, round(fontsize, 2), single_line, round(indent, 1),
+        round(leading, 3) if leading else None,
     )
 
 
-def fit_and_insert(page, rect, text, fontsize, single_line=False, indent=0.0):
+def fit_and_insert(page, rect, text, fontsize, single_line=False, indent=0.0, leading=None,
+                    report=None):
     """Insert text (with '*italic*' markup) into rect. The box height was
     already sized to fit via measure_height, so scale_low=0 is just a
-    safety net against small rounding differences between the two calls."""
+    safety net against small rounding differences between the two calls --
+    with scale_low=0, MuPDF is free to shrink the text as far as it needs
+    to make it fit rather than reporting a failure, so a real disagreement
+    between measure_height's scratch-page measurement and this actual
+    render (a leading/font-fallback/cache-key discrepancy) would otherwise
+    show up only as a visually subtle shrunken paragraph -- invisible to
+    every warning path Rounds 1-5 built. insert_htmlbox's return is
+    (spare_height, scale); report()ing when scale is below 1.0 turns that
+    entire class of future measure/render regressions grep-able instead of
+    silent, the same argument Round 4 Finding 1 made for report() itself."""
     archive, css = font_setup()
-    page.insert_htmlbox(
-        rect, paragraph_html(text, fontsize, single_line, indent),
+    _spare, scale = page.insert_htmlbox(
+        rect, paragraph_html(text, fontsize, single_line, indent, leading),
         css=css, archive=archive, scale_low=0,
     )
+    if report and scale < 0.999:
+        report(f"  WARNING: paragraph rendered at {scale:.2f}x -- "
+               "measure_height disagreed with the actual render")
 
 
 MIN_PARA_GAP = 2.0      # smallest gap we will squeeze a paragraph gap down to
@@ -846,8 +985,19 @@ def fit_placements_to_page(placements, page_rect, bottom_margin=18.0, report=Non
         """Place the paragraphs top-down at `scale`, with gaps shrunk only as
         far as needed. Returns (rects, sizes, overflow)."""
         sizes = [p["size"] * scale for p in flowing]
+        # Uses box_height (not tight_height -- see measure_height) since
+        # these heights size the actual rects a rescaled page is inserted
+        # with, and here that rect's own height *is* what determines the
+        # next paragraph's y-offset within this same layout pass -- unlike
+        # place()'s reflow chain, there's no separately-tracked "original
+        # gap" input for a rescale to preserve, so there's nothing here for
+        # a subsequent reformat-only pass to read back and re-inflate
+        # (a page rescaled once should fit at scale 1.0 on the next pass
+        # and not need rescaling again at all). A repeatedly-rescaled page
+        # is a narrow edge case not covered by Round 5 Finding 3's fix.
         heights = [
-            measure_height(p["rect"].width, p["text"], sz, p["single_line"], p.get("indent", 0.0)) + 2
+            measure_height(p["rect"].width, p["text"], sz, p["single_line"],
+                           p.get("indent", 0.0), p.get("leading"))[0]
             for p, sz in zip(flowing, sizes)
         ]
         need = sum(heights) + sum(max(g, MIN_PARA_GAP) for g in gaps)
@@ -1105,6 +1255,7 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
                     prev_was_short and is_short
                 )
                 indent = para.get("indent", 0.0)
+                leading = para.get("leading")
                 if pinned:
                     # Keep its original y and skip the prev_orig_y1/prev_new_y1
                     # chain entirely, so it neither inherits the body's
@@ -1114,10 +1265,10 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
                     # footnote entries shouldn't break tight-run detection for
                     # the entry after it).
                     new_y0 = para["bbox"].y0
-                    needed_h = measure_height(width, translated, size, single_line, indent)
+                    box_h, _tight_h = measure_height(width, translated, size, single_line, indent, leading)
                     placements.append({
-                        "rect": fitz.Rect(x0, new_y0, x1, new_y0 + needed_h + 2),
-                        "text": translated, "size": size, "indent": indent,
+                        "rect": fitz.Rect(x0, new_y0, x1, new_y0 + box_h),
+                        "text": translated, "size": size, "indent": indent, "leading": leading,
                         "single_line": single_line, "pinned": True,
                     })
                     return
@@ -1136,15 +1287,30 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
                     new_y0 = prev_new_y1 + 3.0
                 else:
                     new_y0 = prev_new_y1 + (para["bbox"].y0 - prev_orig_y1)
-                needed_h = measure_height(width, translated, size, single_line, indent)
-                insert_bbox = fitz.Rect(x0, new_y0, x1, new_y0 + needed_h + 2)
+                box_h, tight_h = measure_height(width, translated, size, single_line, indent, leading)
+                insert_bbox = fitz.Rect(x0, new_y0, x1, new_y0 + box_h)
                 prev_orig_y1 = para["bbox"].y1
-                prev_new_y1 = insert_bbox.y1
+                # Anchored to new_y0 + tight_h (the glyph-only extent), not
+                # insert_bbox.y1 (the CSS line-box height, a few points
+                # taller -- see measure_height). Round 5 Finding 3: using
+                # the padded box height here planted a gap that a *later*
+                # reformat-only pass's re-extraction would read back as
+                # part of "the original gap" to the next paragraph and
+                # preserve verbatim, plus add a fresh instance of the same
+                # gap on top -- compounding every pass, forever (2
+                # paragraphs drifted +3pt/pass, 8 paragraphs +21pt/pass).
+                # Anchoring on the same tight geometry a real re-extraction
+                # will actually see leaves nothing left to compound.
+                # insert_bbox itself still uses the full box_h, so nothing
+                # clips; the few points of line-box padding below the last
+                # line just becomes harmless blank space before the next
+                # paragraph's rect starts, well short of overlapping it.
+                prev_new_y1 = new_y0 + tight_h
                 prev_was_small_text = is_small_text
                 prev_was_short = is_short
                 placements.append({
                     "rect": insert_bbox, "text": translated, "size": size, "indent": indent,
-                    "single_line": single_line, "pinned": False,
+                    "leading": leading, "single_line": single_line, "pinned": False,
                 })
 
             for para in paragraphs:
@@ -1218,7 +1384,8 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
                 )
 
             for p in placements:
-                fit_and_insert(page, p["rect"], p["text"], p["size"], p["single_line"], p.get("indent", 0.0))
+                fit_and_insert(page, p["rect"], p["text"], p["size"], p["single_line"],
+                               p.get("indent", 0.0), p.get("leading"), report)
 
         # Document-level metadata (title/subject) is otherwise left entirely
         # untouched -- the body text gets translated but the PDF's own

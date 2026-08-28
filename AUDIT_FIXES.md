@@ -976,3 +976,327 @@ since reformat-only mode was never translating those pages to begin with.
 **Verified:** `translate_pdf.py in.pdf --check --pages 1-5` on a
 multi-page document no longer prints the notice; `--reformat-only --pages
 1-5` prints the reformat-specific wording.
+
+---
+
+## Round 5 — a level deeper: inside-paragraph fidelity and reformat idempotency (14 findings)
+
+Commit audited: `99b52f5` ("Fix all 22 findings from Round 4 audit").
+Method: cloned on Linux x86 with only `requirements.txt`, all three
+existing test files run first (all pass), then targeted repro scripts
+driving the real `process_pdf` with `load_model`/`translate` stubbed,
+comparing source vs. output geometry via `get_text("dict")`. Rounds 1-4 had
+been thorough on inter-paragraph spacing, marker plumbing, and watcher
+robustness; this round's two biggest findings are one level down from
+there: what happens *inside* a paragraph (leading), and what happens when
+the pipeline eats its own output repeatedly (reformat idempotency).
+
+Fixed in the audit's own suggested order: **1** (content-corrupting, three
+lines) → **8, 9** (one-liners) → **14** (rotated-page fixture, added before
+the geometry work below) → **2**, then **3** (leading, then reformat
+idempotency -- fixing leading first tightens measure/render agreement,
+making the idempotency fix cleaner) → **11** (the tripwire for both) →
+**4, 7** (the validation cluster) → **5, 6** (bold/typeface -- documented
+rather than implemented, both explicitly offered as legitimate cheaper
+fixes) → **10, 12, 13** (robustness and hygiene).
+
+### 1. P0 — a real superscript footnote marker went undetected, corrupting the adjacent number — Fixed + verified
+
+`span_is_footnote_marker()` accepted a marker only if it was smaller than
+80% of body size, or written with Unicode superscript *glyphs* (¹²³). A
+**real PDF superscript** -- ASCII digits, raised by the typesetter, set at
+a typical ~0.83x body size -- falls in the dead zone between those two
+checks: 0.83 > 0.8 fails the size test, and plain ASCII digits fail the
+glyph test. PyMuPDF already flags this (`flags & 1`, PyMuPDF's superscript
+bit) and nothing asked. Result: `"1938" + superscript "1"` fused into
+`"19381"` before `preserve_footnote_markers` ever saw it -- the exact
+failure `[N]` markers exist to prevent, corrupting a *year* -- and
+`starts_with_marker()` (which delegates to the same predicate) couldn't
+split consecutive footnote-marker-led entries either, regressing Round 3
+Finding 3 for this input class.
+
+**Fix:** added `is_superscript = bool(span.get("flags", 0) & 1)` as a third
+accepting condition. Noted but left permissive: this also now matches a
+genuine math exponent (`x²`), also digits-only and superscript-flagged --
+harmless in practice (near-empty guard + `[N]` round-trip make a
+wrongly-marked exponent cosmetic, not corrupting), so not worth the
+complexity of a "glued to a word" positional guard.
+
+**Verified:** `span_is_footnote_marker({"text": "1", "size": 9.96, "flags":
+5}, 12.0)` (9.96/12.0 = 0.83) now returns `"1"` (`tests/test_units.py`);
+end to end, a fixture built with real `insert_htmlbox` `<sup>` tags
+(`tests/test_layout.py`) confirms the year stays `"1938"` (not `"19381"`)
+and both `[1]`/`[2]` markers survive.
+
+### 2. P1 — the source's line leading was never reproduced — Fixed + verified
+
+`paragraph_html()` emitted `font-size`/`text-align`/`text-indent` but never
+`line-height`, so every paragraph rendered at MuPDF's user-agent default of
+1.2x font-size regardless of the source's actual leading. Quantified on an
+identical fixture varying only in leading, translated with an identity
+stub (byte-for-byte unchanged text): 15pt leading on 11pt type (1.36x, an
+entirely ordinary academic setting) rendered at a fixed 13.2pt (1.2x), a
+paragraph-block-height error of **-10%**; 18pt leading (1.64x) was **-22%**.
+A source set *tighter* than 1.2x could even trip a spurious
+`fit_placements_to_page` rescale with zero text change.
+
+**Fix:** `split_page_into_paragraphs` now records the median of consecutive
+line-start deltas within a paragraph, as a *ratio* to font size (e.g.
+1.36), not an absolute point value -- CSS's unitless `line-height` is
+itself already relative to whatever font-size applies, so a paragraph
+rescaled by `fit_placements_to_page` keeps the same proportions for free
+with no extra math on this end. Threaded through `paragraph_html`,
+`measure_height` (added to the cache key), `fit_and_insert`, and every
+`placements` dict, exactly as Round 4 Finding 4 threaded `indent`. Median,
+not mean, so one anomalous gap (a widow line, an accidental double break)
+doesn't skew the whole paragraph.
+
+**Verified:** a 6-paragraph fixture at 15pt/11pt leading now round-trips to
+output line deltas of 15.0pt exactly (`tests/test_layout.py`), across
+12/13.2/15/18pt source leadings tested directly (12.00/13.20/15.00/18.00pt
+output, exact); the spurious-rescale case (11pt on 11.5pt leading, 54
+lines) no longer reports any rescale/overflow.
+
+### 3. P1 — `--reformat-only` was not idempotent; each pass grew the page — Fixed + verified
+
+Traced to a deeper mechanism than the audit's own initial diagnosis (a
+manual `+2` pad on each paragraph's rect): `measure_height`'s returned
+height was the *CSS line-box height* (`3000 - spare_height` from
+`insert_htmlbox`), which is a few points taller than the *glyph-only*
+extent `get_text("dict")` reports back on re-extraction -- CSS reserves
+space above the first line's cap-height and below the last line's
+descender beyond the actual glyphs. That box-height value fed
+`prev_new_y1`, the anchor `place()`'s reflow chain uses to compute the
+*next* paragraph's position -- so a later reformat-only pass's
+re-extraction read the paragraph's inflated *rendered* gap back as "the
+original gap," preserved it, and then added a fresh instance of the same
+box-vs-glyph excess on top. Confirmed both mechanisms independently:
+removing the manual `+2` alone (audit's own repro: simple separated
+paragraphs) already fixed idempotency in that specific case, but a more
+complex fixture (the golden fixture's own footnote/body mix) kept drifting
+~0.1-0.15pt/pass with the `+2` removed but the box-height-anchoring bug
+still present -- confirming the box-height mismatch as the deeper root
+cause, with the manual pad as an *additional*, smaller contributor.
+
+**Fix, two parts:** (1) dropped the manual `+2` entirely -- `scale_low=0`
+on the real `insert_htmlbox` call remains the safety net for genuine
+rounding disagreement (see Finding 11). (2) `measure_height` now returns
+`(box_height, tight_height)`: `box_height` (the CSS line-box figure) still
+sizes the actual insertion rect, so nothing clips; `tight_height` (the real
+glyph-bbox extent, computed by reading the scratch page's own rendered
+lines back) is what `prev_new_y1` is now anchored to, matching exactly what
+a future re-extraction will see. `fit_placements_to_page`'s rescale loop
+keeps using `box_height` for its own rect sizing -- a page that's been
+rescaled once should fit at scale 1.0 on the next pass and not need
+rescaling again, so this narrower edge case wasn't chased further here.
+
+**Verified:** a 6-paragraph fixture (separate `<p>` blocks, real 14pt
+gaps) run through 5 successive `--reformat-only` passes: body block height
+`301.957` on every single pass, not just "within 1pt" but bit-for-bit
+identical. Confirmed the fix is load-bearing by reverting the
+`tight_height` anchoring alone (keeping `box_height` for the chain, the
+pre-fix behavior) -- the idempotency test fails immediately. Added as a
+permanent case in `tests/test_layout.py`, per the audit's own framing of
+this as "the single highest-value test to add."
+
+### 4. P2 — `_REFUSAL_RE` false-positived on ordinary German prose — Fixed + verified
+
+`_REFUSAL_RE` matched any output starting with "please"/"sorry"/"I
+can(not)" -- exactly how "Bitte beachten Sie..." ("Please note..."), "Es
+tut mir leid, sagte er..." ("Sorry, he said...") and "Ich kann diese These
+nicht teilen..." ("I cannot share this thesis...") legitimately translate.
+Consequence: a spurious warning on good output, and at any non-zero
+`--temp`, a wasted full model call on the retry path.
+
+**Fix:** `looks_like_refusal()` now requires the opener to be followed,
+within an 80-character prefix, by task-shaped vocabulary a genuine
+translation-refusal would use ("provide", "translat*", "text", "German").
+An initial attempt also gated on the *source* not itself opening with a
+German polite trigger (the audit's own suggested fix) -- rejected after
+testing, because it incorrectly suppressed the genuine-refusal case where
+the source itself happens to be phrased as a meta-request ("Bitte geben
+Sie den deutschen Text an." -> "Please provide the German text."): the
+task-vocabulary check alone already discriminates every case correctly
+without that extra, over-broad guard.
+
+**Verified** against all four of the audit's own cases: the three
+false-positive prose examples now correctly return `None`; the genuine
+refusal example is still correctly flagged, including specifically the
+variant where the source also opens with "Bitte" (`tests/test_units.py`).
+
+### 5. P2 — bold is silently dropped and rendered as italic instead — Documented, not implemented
+
+`span_is_italic()` checks `flags & 2`; PyMuPDF's bold bit is `flags & 16`
+and nothing checks it, so a bold heading or emphasis run renders as plain
+text. Doubly lost: `text_to_html` also normalizes the model's own
+`**bold**` output down to a single `*` (i.e. into *italic*), so even
+correctly-emitted bold comes out wrong.
+
+**Decision:** documented rather than implemented, per the audit's own
+offered alternative ("the cheaper honest option is to document it").
+Proper support means reusing the asterisk-marking mechanism for a second,
+nested delimiter (`**bold**` vs. `*italic*`, plus a `***both***` case),
+a bold (and probably bold-italic) member in `FONT_CANDIDATES` and
+`font_setup()`'s CSS, and re-deriving `join_paragraph_lines`' and
+`ASTERISK_RUN_RE`'s hyphen/italic-boundary logic for two independently
+nestable delimiters -- meaningfully larger and riskier than this round's
+other fixes. Added to README.md's "Known limitations": bold is not carried
+over, and the model's own bold output renders as italic.
+
+### 6. P2 — `para["font"]` was dead data implying font fidelity that doesn't exist — Fixed (deleted) + verified
+
+Assigned and stored, never read anywhere else. Every paragraph renders in
+whichever serif pair `font_setup()` resolves regardless of the source's
+actual typeface -- a defensible choice for this project's target document
+class, but the stored-and-never-read field read as though the source
+typeface were honored when it isn't.
+
+**Fix:** deleted the field (the honest cheap option the audit offered).
+Documented the single-typeface assumption in both
+`split_page_into_paragraphs`'s docstring and README.md's "Known
+limitations."
+
+**Verified:** full test suite still passes with the field removed --
+confirms nothing was actually reading it, as the original `grep` claimed.
+
+### 7. P2 — `bad_translation_reason`'s length-ratio checks had no minimum-length floor — Fixed + verified
+
+The echo check was guarded by `len(t) > 40`; the `<0.35x`/`>3.0x` ratio
+checks were not, so a short paragraph where German's compound-word
+shortening happens to swing the ratio close to the threshold (`"Abkuerzu
+ngsverzeichnis"` -> `"Abbreviations"` is 0.59x; margin thinner than it
+looks) risked a false "probable truncation" on exactly the paragraphs
+(headings) where that's most confusing.
+
+**Fix:** applied the same `len(t) > 40` floor to both ratio checks.
+
+**Verified:** all four of the audit's own compound-word examples
+(`Inhaltsverzeichnis`->`Contents`, `Geschwindigkeitsbegrenzung`->`Local
+speed limit`, etc.) now correctly return `None`.
+
+### 8. P2 — CI didn't run `tests/test_layout.py` — Fixed + verified
+
+`.github/workflows/test.yml` ran `test_golden.py` and `test_units.py`
+only -- `test_layout.py`, covering Round 4's overflow/pinning/collision
+logic and reformat-only end to end, was silently never run in CI. Folded
+all three into one step (each run explicitly, with exit codes combined at
+the end) rather than three separate `- run:` steps, so a failure in one
+file doesn't hide whether the others also failed -- GitHub Actions' default
+`bash -e` would otherwise abort the whole step at the first non-zero exit.
+
+**Verified:** ran the combined shell logic locally with all three files
+passing (all exit 0) and confirmed the job would report a single failure
+correctly when a file's exit code is non-zero (tested by temporarily
+breaking one).
+
+### 9. P2 — `--temp`/`--seed` were undocumented — Fixed
+
+Added to the "Standalone usage" section of README.md, with the same
+determinism rationale already in `translate()`'s own docstring.
+
+### 10. P2 — the watcher's retry marker could be stranded permanently — Fixed + verified
+
+`RETRY_MARKER` was cleared in exactly one place (`_main()`'s happy-path
+`else` branch); if `_main()` raised anywhere after the marker was written
+(`commit()`/`save_state()`/`log_result()`/`cleanup_stale_part_files()` are
+all outside a `try`), or the detached retry child simply never ran (sleep,
+reboot, kill), the marker stranded forever -- `schedule_retry()` returns
+early whenever it exists, with nothing to ever clear it again, silently
+defeating Round 2 leftover #4 for every future slow copy.
+
+**Fix:** the marker already stores its own write time; `schedule_retry()`
+now reads it back and treats a marker older than `STALE_RETRY_MARKER_AGE`
+(3x `RETRY_DELAY`) as stranded rather than live, scheduling a fresh retry
+instead of returning early. An unreadable marker is also treated as stale.
+Did not add the audit's secondary suggestion (also clear the marker in a
+`finally` in `main()`) -- on reflection that would undermine the dedup
+guarantee this mechanism exists for: an unconditional clear on every exit
+would let a crash-then-immediately-re-triggered run spawn a *second*,
+redundant retry child before the first one even fires, which the
+age-based expiry alone doesn't risk.
+
+**Verified:** a fresh marker correctly deduplicates (no subprocess
+spawned); a marker manually backdated past `STALE_RETRY_MARKER_AGE`
+correctly schedules a fresh retry.
+
+### 11. P2 — `fit_and_insert` discarded the one signal that would catch a measure/render mismatch — Fixed + verified
+
+`insert_htmlbox`'s return, `(spare_height, scale)`, was discarded; with
+`scale_low=0`, MuPDF is free to shrink text arbitrarily to make it fit
+rather than report a failure, so any real disagreement between
+`measure_height`'s scratch-page prediction and the actual render (a
+leading/font-fallback/cache-key discrepancy) would show up only as a
+visually subtle shrunken paragraph -- invisible to every warning path
+Rounds 1-5 built.
+
+**Fix:** `fit_and_insert` now takes an optional `report` and warns when
+`scale < 0.999`, threaded in from `process_pdf`'s own `report()`. Same
+argument Round 4 Finding 1 made for `report()` itself: turns a class of
+future layout regressions grep-able instead of silent.
+
+**Verified:** a deliberately undersized rect correctly reports `"paragraph
+rendered at 0.42x -- measure_height disagreed with the actual render"`; a
+normal, correctly-sized render reports nothing.
+
+### 12. P2 — the truncation heuristic compared characters against tokens — Fixed (by inspection; no real model/tokenizer here to exercise it)
+
+`len(out) > max_tokens * 2` compares a **character** count against a
+**token** budget; at ~4 chars/token, `* 2` fires around 50% of budget, not
+"most of it" as the comment claimed.
+
+**Fix:** counts the actual output tokens via `tokenizer.encode(out)` and
+compares against `max_tokens * TRUNCATION_BUDGET_FRAC` (0.9) directly,
+removing the character-based estimate entirely for the normal case; falls
+back to a named `CHARS_PER_TOKEN` (4) estimate only if `encode()` itself
+raises.
+
+### 13. P2 — no packaging; tests are hand-rolled scripts — Fixed (both cheap wins)
+
+Added a minimal `pyproject.toml` declaring `requires-python = ">=3.10"`
+(the actual floor: `scripts/auto_translate_pdf.py`'s `str | None`
+annotation needs 3.10 without the `from __future__ import annotations`
+guard it happens to have; nothing previously declared a supported version
+at all) and the split base/mlx dependencies as `[project.dependencies]`/
+`[project.optional-dependencies]`.
+
+For pytest-collectibility: all three test files ran their checks as
+unguarded module-level code with a trailing bare `sys.exit()` -- collecting
+them via `pytest tests/` would have raised `SystemExit` during import and
+failed collection entirely, before this fix. Wrapped each file's final
+print-and-exit block in `if __name__ == "__main__":` and added one
+synthetic `test_*` function per file (`assert not failures`, or `assert
+run()` for `test_golden.py`, which already had a `run()` wrapper) so
+`pytest tests/` can collect and run them without changing any of the
+existing checks' logic, output, or standalone `python tests/test_x.py`
+behavior. Not installed as a project dependency (not currently used
+anywhere), so untested against a real pytest run -- verified instead by
+confirming all three files now import cleanly with zero side effects
+(no `SystemExit`, no checks silently skipped) and that direct execution
+(`python tests/test_x.py`) still produces identical output and exit codes.
+
+### 14. P2 — rotated pages had no fixture — Fixed + verified
+
+`AUDIT_FIXES.md` (Round 4 Finding 17) recorded `/Rotate 90` as spot-checked
+by hand and "an accident of PyMuPDF's coordinate handling, not something
+the code reasons about" -- with findings 2 and 3 above both changing how
+rects are computed, "works by accident, verified by hand, untested" was
+exactly the setup to pin down first.
+
+**Fix:** added a `/Rotate 90` fixture to `tests/test_layout.py`,
+confirming why it works: `get_text("dict")`'s span bboxes and `page.rect`
+are *both* already in the rotated/display coordinate space, not the
+underlying mediabox, so extraction, redaction, and `insert_htmlbox` all
+agree without the pipeline needing to reason about the rotation transform
+at all.
+
+**Verified:** a rotated fixture round-trips through `process_pdf` with
+`/Rotate 90` preserved in the output and translated content intact.
+
+---
+
+All 14 of Round 5's findings are addressed: 12 fixed and verified, 1 fixed
+by inspection only (12, needs a real tokenizer to exercise), and 1
+documented rather than implemented (5, bold support -- explicitly offered
+as a legitimate alternative to a meaningfully larger, riskier change).
+Finding 6 (dead `font` field) was fixed by deletion rather than by
+implementing font fidelity, also per the audit's own offered alternative.

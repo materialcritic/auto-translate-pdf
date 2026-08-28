@@ -176,5 +176,11 @@ def run():
     return not failures
 
 
+def test_golden_file():
+    """Synthetic pytest entry point -- see tests/test_layout.py's copy of
+    this docstring for why (Round 5 Finding 13)."""
+    assert run()
+
+
 if __name__ == "__main__":
     sys.exit(0 if run() else 1)

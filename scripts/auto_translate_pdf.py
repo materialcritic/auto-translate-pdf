@@ -43,6 +43,7 @@ PROGRESS_FILE = APP_SUPPORT_DIR / "progress.log"
 RETRY_MARKER = APP_SUPPORT_DIR / "retry_pending"
 LOG_FILE = FOLDER / "translate_log.csv"
 RETRY_DELAY = 150.0  # seconds; comfortably longer than wait_until_stable's 120s timeout
+STALE_RETRY_MARKER_AGE = RETRY_DELAY * 3  # older than this -> the marker is presumed stranded
 
 LOCK_FILE = APP_SUPPORT_DIR / "auto_translate_pdf.lock"
 
@@ -225,10 +226,26 @@ def schedule_retry() -> None:
     dropped in the folder. Left alone, a single slow copy can strand
     itself indefinitely. RETRY_MARKER de-dupes: only one retry is ever
     outstanding at a time, so a busy folder doesn't spawn a growing pile of
-    them (the marker is cleared once a run completes with nothing left
-    waiting on stability)."""
+    them (the marker is normally cleared once a run completes with nothing
+    left waiting on stability).
+
+    That "normally" matters: the marker can also be stranded -- _main()
+    raising anywhere after it's written (a crash in commit()/save_state()/
+    log_result(), none of which are wrapped in a try), or the detached
+    child simply never running (the machine sleeps, reboots, gets killed).
+    Once stranded, this function returned early forever with no marker
+    ever there to expire it -- exactly the "a slow copy is never retried"
+    failure this whole mechanism exists to prevent, just moved one level
+    up. The marker's own age (it stores its write time) is checked before
+    treating it as still-live."""
     if RETRY_MARKER.exists():
-        return
+        try:
+            age = time.time() - float(RETRY_MARKER.read_text().strip())
+        except (ValueError, OSError):
+            age = STALE_RETRY_MARKER_AGE + 1  # unreadable -> treat as stale
+        if age < STALE_RETRY_MARKER_AGE:
+            return
+        # Stale: fall through and schedule a fresh retry.
     RETRY_MARKER.write_text(str(time.time()))
     script = str(Path(__file__).resolve())
     # No shell involved, so no quoting to get wrong: `!r` (Python repr, not

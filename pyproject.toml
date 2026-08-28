@@ -1,0 +1,30 @@
+[project]
+name = "auto-translate-pdf"
+version = "0.1.0"
+description = "Layout-preserving German -> English PDF translator (TranslateGemma 4B via mlx-lm)"
+readme = "README.md"
+license = { text = "MIT" }
+# Nothing currently pins this explicitly (CI's 3.12 in
+# .github/workflows/test.yml is an artifact of the workflow, not a
+# declared minimum) -- 3.10 is the actual floor: scripts/auto_translate_pdf.py
+# uses `str | None` in a type annotation (fine at any version under
+# `from __future__ import annotations`, which defers evaluation) and
+# `Path.unlink(missing_ok=True)`, which needs 3.8+; `str | None` written
+# without the future import needs 3.10+, so 3.10 is pinned as the honest
+# floor for anyone running this without that import guard in their own code.
+requires-python = ">=3.10"
+dependencies = [
+    "pymupdf==1.28.2",
+]
+
+[project.optional-dependencies]
+mlx = [
+    "mlx-lm==0.31.3",
+    "huggingface_hub==1.28.0",
+]
+
+# No build-system / packaging metadata beyond [project]: this isn't
+# published or installed as a package (translate_pdf.py and
+# scripts/auto_translate_pdf.py are run directly, per README.md), so this
+# file exists to declare the supported Python version and dependencies in
+# one machine-readable place, not to make `pip install .` work.

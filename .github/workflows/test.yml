@@ -9,5 +9,16 @@ jobs:
         with: { python-version: "3.12" }
       - run: sudo apt-get update && sudo apt-get install -y fonts-liberation
       - run: pip install -r requirements.txt
-      - run: python tests/test_golden.py
-      - run: python tests/test_units.py
+      # Runs all three test files even if an earlier one fails (GitHub
+      # Actions' default `bash -e` would otherwise abort this whole step at
+      # the first non-zero exit, hiding the later files' results exactly
+      # the way three separate `- run:` steps did before this), then fails
+      # the job overall if any of them did. One log shows every failure.
+      - run: |
+          set +e
+          python tests/test_units.py; s1=$?
+          python tests/test_golden.py; s2=$?
+          python tests/test_layout.py; s3=$?
+          if [ $s1 -ne 0 ] || [ $s2 -ne 0 ] || [ $s3 -ne 0 ]; then
+            exit 1
+          fi

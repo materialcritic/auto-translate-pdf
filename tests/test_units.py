@@ -108,12 +108,22 @@ check('as_marker_digits: too many digits (>3) returns None',
 small_marker = {"text": "1", "size": 6.5}
 full_size_marker = {"text": "¹", "size": 9.0}  # superscript glyph, full body size
 not_a_marker = {"text": "1938", "size": 9.0}
+# A real PDF superscript: ASCII digits, raised by the typesetter, set at a
+# typical ~0.83x body size -- falls in the dead zone between "small enough
+# to catch on size alone" (< 0.8x) and "full body size" (Unicode glyph
+# check), so only the `flags & 1` (PyMuPDF's superscript bit) check catches
+# it (Round 5 Finding 1). flags=5 here mirrors real PyMuPDF output: bit 2
+# (serif/bit-4? -- irrelevant bits from the real repro) plus bit 0 set.
+real_pdf_superscript = {"text": "1", "size": 9.96, "flags": 5}  # 9.96/12.0 = 0.83
 check("span_is_footnote_marker: small digit-only span is a marker",
       tp.span_is_footnote_marker(small_marker, 9.0) == "1")
 check("span_is_footnote_marker: full-size superscript GLYPH is still a marker",
       tp.span_is_footnote_marker(full_size_marker, 9.0) == "1")
 check("span_is_footnote_marker: full-size ASCII digits are NOT a marker",
       tp.span_is_footnote_marker(not_a_marker, 9.0) is None)
+check("span_is_footnote_marker: a real PDF superscript at 0.83x body size "
+      "IS a marker (Round 5 Finding 1 -- flags&1 superscript bit)",
+      tp.span_is_footnote_marker(real_pdf_superscript, 12.0) == "1")
 
 # --- preserve_footnote_markers ---
 
@@ -139,12 +149,36 @@ check("bad_translation_reason: echoed source flagged",
 check("bad_translation_reason: much-shorter output flagged (probable truncation)",
       tp.bad_translation_reason("x" * 100, "short") is not None)
 check("bad_translation_reason: much-longer output flagged (probable runaway)",
-      tp.bad_translation_reason("short text here", "x" * 200) is not None)
+      tp.bad_translation_reason("x" * 50, "x" * 200) is not None)
+check("bad_translation_reason: length-ratio checks have a length floor "
+      "(Round 5 Finding 7) -- a short heading with a legitimately "
+      "different-length translation isn't flagged",
+      tp.bad_translation_reason("Inhaltsverzeichnis", "Contents") is None
+      and tp.bad_translation_reason("Abkuerzungsverzeichnis", "Abbreviations") is None)
 check("bad_translation_reason: conversational refusal flagged",
       tp.bad_translation_reason(
           "Ein kurzer Satz.",
           "Please provide the German text you would like translated.",
       ) is not None)
+
+# --- Round 5 Finding 4: _REFUSAL_RE false-positived on ordinary German
+# --- prose that legitimately translates to "Please...", "Sorry...",
+# --- "I cannot..." -- these must NOT be flagged, and a genuine refusal
+# --- must still BE flagged even when the source itself happens to open
+# --- with the corresponding German trigger word (gating on the source's
+# --- own opening words, rather than on the output naming the task, was
+# --- tried and rejected: it incorrectly suppressed this last case). ---
+
+check('Finding 4: "Bitte beachten Sie..." -> "Please note..." is not a refusal',
+      not tp.looks_like_refusal("Please note the following guidance on using this document."))
+check('Finding 4: "Es tut mir leid, sagte er..." -> "Sorry, he said..." is not a refusal',
+      not tp.looks_like_refusal("Sorry, he said, but I cannot change that today unfortunately."))
+check('Finding 4: "Ich kann diese These nicht teilen..." -> "I cannot share this '
+      'thesis..." is not a refusal',
+      not tp.looks_like_refusal("I cannot share this thesis, as in my view it is incorrect."))
+check('Finding 4: a genuine refusal is still flagged even when the source itself '
+      'opens with "Bitte..."',
+      tp.looks_like_refusal("Please provide the German text you would like translated."))
 
 # --- parse_page_range ---
 
@@ -194,9 +228,16 @@ check("detect_columns: empty input is 1 column",
       tp.detect_columns([], page_width=468.0) == 1)
 
 
-print()
-if failures:
-    print(f"{len(failures)} check(s) FAILED: {', '.join(failures)}")
-else:
-    print("All checks passed.")
-sys.exit(0 if not failures else 1)
+def test_all_checks():
+    """Synthetic pytest entry point -- see tests/test_layout.py's copy of
+    this docstring for why (Round 5 Finding 13)."""
+    assert not failures, f"{len(failures)} check(s) failed: {', '.join(failures)}"
+
+
+if __name__ == "__main__":
+    print()
+    if failures:
+        print(f"{len(failures)} check(s) FAILED: {', '.join(failures)}")
+    else:
+        print("All checks passed.")
+    sys.exit(0 if not failures else 1)

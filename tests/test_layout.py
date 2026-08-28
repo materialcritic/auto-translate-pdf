@@ -15,10 +15,12 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pymupdf as fitz  # noqa: E402
 
 import translate_pdf as tp  # noqa: E402
+from fixtures import build_fixture  # noqa: E402
 
 failures = []
 
@@ -59,9 +61,16 @@ with tempfile.TemporaryDirectory() as d:
     fx, out = d / "in.pdf", d / "out.pdf"
     doc = fitz.open()
     page = doc.new_page(width=300, height=400)  # small page -> easy to overflow
+    # Lines 13pt apart (~1.3x the 10pt font -- an ordinary leading), not an
+    # arbitrary wide spacing: since Round 5 Finding 2, split_page_into_
+    # paragraphs now measures and preserves the source's own line-to-line
+    # spacing as this paragraph's real leading, so an unrealistically wide
+    # gap here would be honored as intentional and blow the translated
+    # (12x-expanded) text's height far past what this test means to
+    # exercise (a moderate, rescale-only overflow, not a true one).
     page.insert_text((72, 72), "Erster kurzer deutscher Satz hier.", fontsize=10)
-    page.insert_text((72, 100), "Zweiter kurzer deutscher Satz auch hier.", fontsize=10)
-    page.insert_text((72, 128), "Dritter kurzer deutscher Satz ebenfalls.", fontsize=10)
+    page.insert_text((72, 85), "Zweiter kurzer deutscher Satz auch hier.", fontsize=10)
+    page.insert_text((72, 98), "Dritter kurzer deutscher Satz ebenfalls.", fontsize=10)
     page.insert_text((130, 370), "5", fontsize=9)  # folio; footer band = 400*0.88 = 352
     doc.save(str(fx))
     doc.close()
@@ -217,9 +226,197 @@ with tempfile.TemporaryDirectory() as d:
           "TRANSLATED:" in page3_text, page3_text)
 
 
-print()
-if failures:
-    print(f"{len(failures)} check(s) FAILED: {', '.join(failures)}")
-else:
-    print("All checks passed.")
-sys.exit(0 if not failures else 1)
+# --- Round 5 Finding 1: a real PDF superscript footnote marker (ASCII
+# --- digits, raised by the typesetter, ~0.83x body size -- the dead zone
+# --- between the old size-only test and the Unicode-glyph test) must be
+# --- recognized, not fused into the adjacent number. Built with
+# --- insert_htmlbox's <sup> (not insert_text, which places literal glyphs
+# --- with no superscript flag set at all). ---
+
+translate_calls = []
+tp.translate = lambda m, t, txt, temp=0.0, report=None: (translate_calls.append(txt) or txt)
+
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    fx, out = d / "in.pdf", d / "out.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=600, height=300)
+    page.insert_htmlbox(
+        fitz.Rect(72, 80, 520, 200),
+        "Horkheimer schrieb dies im Jahr 1938<sup>1</sup> in New York, kurz "
+        "nach der Emigration.<br>Adorno widersprach ihm<sup>2</sup> in einem "
+        "Brief aus Oxford.",
+    )
+    doc.save(str(fx))
+    doc.close()
+
+    tp.process_pdf(str(fx), str(out), "stub")
+
+    joined = " ".join(translate_calls)
+    check("Finding 1: the real superscript marker did NOT fuse into the "
+          'adjacent year ("19381"); the year stayed "1938"',
+          "19381" not in joined and "1938" in joined, translate_calls)
+    check("Finding 1: both footnote markers survived as separate [N] tokens",
+          "[1]" in joined and "[2]" in joined, translate_calls)
+
+
+# --- Round 5 Finding 14: a /Rotate 90 page. AUDIT_FIXES.md's Round 4
+# --- Finding 17 recorded this as spot-checked by hand and "an accident of
+# --- PyMuPDF's coordinate handling, not something the code reasons about"
+# --- -- pin the accident down before any future geometry change (leading,
+# --- reformat idempotency, etc.) has a chance to silently break it. Works
+# --- because get_text("dict")'s span bboxes and page.rect are BOTH already
+# --- in the rotated/display coordinate space, not the underlying mediabox
+# --- -- so extraction, redaction, and insert_htmlbox all agree without the
+# --- pipeline needing to reason about the rotation transform itself.
+
+tp.translate = lambda m, t, txt, temp=0.0, report=None: "TRANSLATED: " + txt
+
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    fx, out = d / "in.pdf", d / "out.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=600)
+    page.set_rotation(90)
+    page.insert_text((72, 72), "Ein deutscher Satz auf einer gedrehten Seite hier drin.",
+                      fontsize=10)
+    doc.save(str(fx))
+    doc.close()
+
+    tp.process_pdf(str(fx), str(out), "stub")
+    o = fitz.open(str(out))
+    check("rotated page: /Rotate is preserved in the output",
+          o[0].rotation == 90, o[0].rotation)
+    check("rotated page: content was translated and survived",
+          "TRANSLATED" in o[0].get_text() and "gedrehten" in o[0].get_text(),
+          o[0].get_text())
+    o.close()
+
+
+# --- Round 5 Finding 2: the source's own line leading must be reproduced,
+# --- not silently re-set at MuPDF's user-agent default of 1.2x. A
+# --- paragraph set at 15pt leading on 11pt type (an entirely ordinary
+# --- academic setting -- 1.36x) rendered at a fixed 13.2pt (1.2x) before
+# --- this fix, off by up to +/-22% of the paragraph's height with *zero*
+# --- text change (identity translation). ---
+
+tp.translate = lambda m, t, txt, temp=0.0, report=None: txt  # identity -- isolates leading alone
+
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    fx, out = d / "in.pdf", d / "out.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=700)
+    source_leading = 15.0
+    y = 72.0
+    for i in range(6):
+        x = 90 if i == 0 else 72  # first line indented, matching real body prose
+        page.insert_text((x, y), f"Zeile Nummer {i} mit deutschem Text darin heute wirklich.",
+                          fontsize=11)
+        y += source_leading
+    doc.save(str(fx))
+    doc.close()
+
+    tp.process_pdf(str(fx), str(out), "stub")
+    lines = output_lines(out)
+    ys = sorted(l["bbox"][1] for l in lines)
+    deltas = [b - a for a, b in zip(ys, ys[1:])]
+    avg_delta = sum(deltas) / len(deltas) if deltas else 0.0
+    check(f"Finding 2: output line spacing matches the source's {source_leading}pt "
+          f"leading (not MuPDF's 1.2x-of-11pt = 13.2pt default)",
+          abs(avg_delta - source_leading) < 0.5, avg_delta)
+
+
+# --- Round 5 Finding 3: --reformat-only must be idempotent. Each pass used
+# --- to add ~2pt of pad per paragraph to the page it re-extracts, so
+# --- reformatting the same file repeatedly (the mode's own documented
+# --- workflow: "a layout bug got fixed, re-run it on files produced
+# --- before the fix") walked the body steadily down the page forever.
+# ---
+# --- Uses several ordinary multi-line body paragraphs (not the golden
+# --- fixture's footnote entries, which take the fixed-3pt "tight run" gap
+# --- branch in reformat mode and are drift-immune by construction either
+# --- way) -- the compounding lives specifically in the general
+# --- gap-preservation branch ordinary body prose takes.
+
+tp.translate = lambda m, t, txt, temp=0.0, report=None: txt
+archive, css = tp.font_setup()
+
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    fx = d / "in.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=700)
+    y = 72.0
+    for i in range(6):
+        html = (f'<p style="font-size:11pt; text-indent:18pt; text-align:justify;">'
+                f"Absatz Nummer {i} mit etwas laengerem deutschem Text darin heute, "
+                "der ueber zwei Zeilen laeuft mal wieder ganz bestimmt und weiter.</p>")
+        rect = fitz.Rect(72, y, 328, y + 60)
+        page.insert_htmlbox(rect, html, css=css, archive=archive)
+        actual_lines = [
+            l for b in page.get_text("dict")["blocks"] if b["type"] == 0
+            for l in b["lines"] if l["bbox"][1] >= y - 1
+        ]
+        y = max(l["bbox"][3] for l in actual_lines) + 14  # real gap to the next paragraph
+    doc.save(str(fx))
+    doc.close()
+
+    heights = []
+    prev = fx
+    for n in range(1, 4):
+        out = d / f"reformatted_{n}.pdf"
+        tp.process_pdf(str(prev), str(out), None, skip_translation=True)
+        lines = output_lines(out)
+        ys = [l["bbox"][1] for l in lines] + [l["bbox"][3] for l in lines]
+        heights.append(max(ys) - min(ys))
+        prev = out
+
+    check("Finding 3: --reformat-only is idempotent -- body block height "
+          "stays stable (within 1pt) across 3 successive reformat passes, "
+          "not drifting further every time",
+          max(heights) - min(heights) < 1.0, heights)
+
+
+# --- Round 5 Finding 11: fit_and_insert must report when the real render
+# --- disagrees with measure_height's prediction (scale_low=0 lets MuPDF
+# --- shrink silently rather than fail) -- a deliberately undersized rect
+# --- stands in for that disagreement. ---
+
+reports = []
+archive, css = tp.font_setup()
+page = fitz.open().new_page(width=200, height=200)
+tp.fit_and_insert(page, fitz.Rect(10, 10, 100, 20),
+                   "Ein sehr langer deutscher Testsatz der garantiert nicht in diese "
+                   "winzige Box passt.", 10.0, False, 0.0, None, reports.append)
+check("Finding 11: a real measure/render mismatch (undersized rect, forced "
+      "shrink) is reported, not silently absorbed",
+      any("disagreed with the actual render" in r for r in reports), reports)
+
+reports2 = []
+page2 = fitz.open().new_page(width=400, height=400)
+tp.fit_and_insert(page2, fitz.Rect(10, 10, 380, 100),
+                   "Ein kurzer deutscher Satz.", 10.0, False, 0.0, None, reports2.append)
+check("Finding 11: a normal, correctly-sized render reports nothing",
+      reports2 == [], reports2)
+
+
+def test_all_checks():
+    """Synthetic pytest entry point. All the real checks above already ran
+    as a side effect of importing this module (this file predates pytest
+    and is designed to run standalone via `python tests/test_layout.py`,
+    printing [PASS]/[FAIL] per check and continuing past a failure to
+    report everything in one run, rather than stopping at the first
+    `assert` the way a normal pytest test would) -- this just gives pytest
+    something to collect, so `pytest tests/` works without rewriting the
+    checks themselves (Round 5 Finding 13)."""
+    assert not failures, f"{len(failures)} check(s) failed: {', '.join(failures)}"
+
+
+if __name__ == "__main__":
+    print()
+    if failures:
+        print(f"{len(failures)} check(s) FAILED: {', '.join(failures)}")
+    else:
+        print("All checks passed.")
+    sys.exit(0 if not failures else 1)

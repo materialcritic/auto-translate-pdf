@@ -44,6 +44,14 @@ on subsequent runs.
 ./venv/bin/python translate_pdf.py input.pdf output.pdf [--pages 1-5]
 ```
 
+Deterministic by default (`--temp 0.0`, seeded RNG) — translation is a
+one-right-answer task, not a creative one, so there's usually no reason to
+raise the temperature; doing so would also cost the reproducibility that
+`--reformat-only` (below) relies on for its own "re-translating would
+introduce fresh non-determinism" rationale. `--temp 0.3` (or any non-zero
+value) opts into sampling; `--seed N` (default `0`) keeps even a non-zero
+`--temp` repeatable run to run.
+
 ### Folder-watch usage (macOS Folder Action)
 
 `scripts/auto_translate_pdf.py` watches a folder (`~/Translate` by default —
@@ -228,6 +236,22 @@ non-zero if anything fails.
 - **Very short italic phrases** (2-3 words) occasionally lose the `*...*`
   marker during translation and render as plain text — content is never
   lost, just the emphasis styling on that one phrase.
+- **Bold is not carried over — only italics.** A bold heading or a bold
+  emphasis run renders as plain regular text; if TranslateGemma itself
+  emits markdown `**bold**` in its output, it renders as *italic* instead
+  (the pipeline only distinguishes "emphasized" from "not," via the same
+  `*...*` marker italics already use — a real bold/italic distinction would
+  need its own marker, its own font-face pair, and its own HTML tag, which
+  hasn't been built). Content is never lost, only that one styling
+  distinction.
+- **Every paragraph renders in one serif typeface** (`font_setup()`'s
+  resolved roman+italic pair — Times New Roman on macOS, Liberation Serif
+  elsewhere), regardless of what font(s) the source document actually used.
+  A sans-serif heading or a source set in a different serif family both
+  come out in the same face as the body text. Defensible for this
+  project's target document class (academic prose is reliably one serif
+  family throughout a given document) but worth knowing before pointing
+  this at something typographically mixed.
 - **A hyphenated word split across a line break can leave a residual
   fragment if the split happens right at a paragraph-merge boundary edge
   case not yet covered** (the common case — including hyphenation across an
