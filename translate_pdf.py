@@ -155,35 +155,46 @@ def translate(model, tokenizer, german_text, temp=DEFAULT_TEMP, report=None):
         model, tokenizer, prompt=prompt, max_tokens=max_tokens, sampler=sampler, verbose=False
     )
     out = restore_sentinel_from_model(out.strip())
-
-    # mlx_lm.generate's plain-string return doesn't expose a finish reason,
-    # so approximate "did this hit the token budget" by checking whether the
-    # output ends in sentence-final punctuation when the source did, and is
-    # already using most of max_tokens (a short, legitimately unpunctuated
-    # fragment shouldn't false-alarm). Count the output's own *tokens*
-    # directly via the same tokenizer rather than estimating from character
-    # count against a token budget -- comparing len(out) (characters)
-    # against max_tokens (tokens) via a fixed multiplier either over- or
-    # under-fires depending how well that multiplier matches the real
-    # chars-per-token ratio for whatever text actually came back; encoding
-    # the real output removes the estimate entirely.
-    if report and _SENTENCE_END_RE.search(german_text.strip()) and not _SENTENCE_END_RE.search(out):
-        try:
-            n_out = len(tokenizer.encode(out))
-        except Exception:
-            n_out = None
-        near_budget = (n_out is not None and n_out > max_tokens * TRUNCATION_BUDGET_FRAC)
-        if n_out is None:
-            # encode() unavailable for some reason -- fall back to the
-            # character-count estimate rather than skipping the check
-            # entirely, at CHARS_PER_TOKEN chars/token (a rough English
-            # average).
-            near_budget = len(out) > max_tokens * CHARS_PER_TOKEN * TRUNCATION_BUDGET_FRAC
-        if near_budget:
-            report(f"  WARNING: translation may be truncated at max_tokens="
-                   f"{max_tokens} (source ended in punctuation, output did not): "
-                   f"...{out[-60:]!r}")
+    check_truncation(tokenizer, german_text, out, max_tokens, report)
     return out
+
+
+def check_truncation(tokenizer, german_text, out, max_tokens, report):
+    """report()s a warning if `out` looks like it was cut off at
+    `max_tokens` rather than actually finished. Split out from translate()
+    itself specifically so this logic is unit-testable with a stub
+    tokenizer/report list (translate() imports mlx_lm for real and can't
+    be exercised without an actual model) -- see tests/test_units.py.
+
+    mlx_lm.generate's plain-string return doesn't expose a finish reason,
+    so this approximates "did this hit the token budget" by checking
+    whether the output ends in sentence-final punctuation when the source
+    did, and is already using most of max_tokens (a short, legitimately
+    unpunctuated fragment shouldn't false-alarm). Counts the output's own
+    *tokens* directly via the same tokenizer rather than estimating from
+    character count against a token budget -- comparing len(out)
+    (characters) against max_tokens (tokens) via a fixed multiplier either
+    over- or under-fires depending how well that multiplier matches the
+    real chars-per-token ratio for whatever text actually came back;
+    encoding the real output removes the estimate entirely."""
+    if not (report and _SENTENCE_END_RE.search(german_text.strip())
+            and not _SENTENCE_END_RE.search(out)):
+        return
+    try:
+        n_out = len(tokenizer.encode(out))
+    except Exception:
+        n_out = None
+    near_budget = (n_out is not None and n_out > max_tokens * TRUNCATION_BUDGET_FRAC)
+    if n_out is None:
+        # encode() unavailable for some reason -- fall back to the
+        # character-count estimate rather than skipping the check
+        # entirely, at CHARS_PER_TOKEN chars/token (a rough English
+        # average).
+        near_budget = len(out) > max_tokens * CHARS_PER_TOKEN * TRUNCATION_BUDGET_FRAC
+    if near_budget:
+        report(f"  WARNING: translation may be truncated at max_tokens="
+               f"{max_tokens} (source ended in punctuation, output did not): "
+               f"...{out[-60:]!r}")
 
 
 def line_text(line):

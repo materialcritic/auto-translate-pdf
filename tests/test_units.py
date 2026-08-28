@@ -180,6 +180,68 @@ check('Finding 4: a genuine refusal is still flagged even when the source itself
       'opens with "Bitte..."',
       tp.looks_like_refusal("Please provide the German text you would like translated."))
 
+# --- Round 5 Finding 12: check_truncation counts real output *tokens* via
+# --- the tokenizer, not characters against a token budget. translate()
+# --- itself imports mlx_lm for real and can't be exercised without an
+# --- actual model, so this tests the extracted, model-free helper
+# --- directly with a stub tokenizer whose encode() mimics a real one
+# --- closely enough to exercise the actual comparison (roughly one token
+# --- per word, not translate_pdf's own CHARS_PER_TOKEN fallback ratio --
+# --- using that same constant here would make the test trivially
+# --- self-consistent instead of actually exercising the token-counting
+# --- path it's meant to replace). ---
+
+
+class _StubTokenizer:
+    """encode() approximates a real BPE tokenizer well enough to exercise
+    check_truncation's token-based comparison: split on whitespace (~1
+    token/word for ordinary English), plus one extra token per punctuation
+    mark (real tokenizers usually split trailing/leading punctuation into
+    its own token)."""
+    def encode(self, text):
+        words = text.split()
+        punctuation = sum(text.count(c) for c in ".,!?;:")
+        return list(range(len(words) + punctuation))
+
+
+_stub_tok = _StubTokenizer()
+
+reports = []
+# Output ends mid-sentence (no final punctuation) while the source did, and
+# uses almost the whole budget -- exactly the truncation shape.
+long_finished_source = "Ein Satz, der eindeutig zu Ende geht mit einem Punkt."
+truncated_output = " ".join(f"word{i}" for i in range(20))  # ~20 tokens, no final punctuation
+tp.check_truncation(_stub_tok, long_finished_source, truncated_output,
+                     max_tokens=22, report=reports.append)
+check("Finding 12: a real near-budget, unfinished-looking output is flagged",
+      len(reports) == 1 and "truncat" in reports[0], reports)
+
+reports.clear()
+# Same output, but the budget is generous -- not near the cap at all.
+tp.check_truncation(_stub_tok, long_finished_source, truncated_output,
+                     max_tokens=200, report=reports.append)
+check("Finding 12: the same output is NOT flagged when max_tokens leaves "
+      "plenty of headroom (not actually near the token budget)",
+      reports == [], reports)
+
+reports.clear()
+# Output legitimately ends in punctuation -- complete, regardless of budget.
+finished_output = " ".join(f"word{i}" for i in range(20)) + "."
+tp.check_truncation(_stub_tok, long_finished_source, finished_output,
+                     max_tokens=22, report=reports.append)
+check("Finding 12: an output that itself ends in punctuation is NOT "
+      "flagged even near the budget (it looks finished)",
+      reports == [], reports)
+
+reports.clear()
+# Source itself has no final punctuation -- nothing to compare against.
+unfinished_source = "Ein Satz ohne Schlusspunkt"
+tp.check_truncation(_stub_tok, unfinished_source, truncated_output,
+                     max_tokens=22, report=reports.append)
+check("Finding 12: no check at all when the source didn't end in "
+      "punctuation either (nothing licenses the comparison)",
+      reports == [], reports)
+
 # --- parse_page_range ---
 
 check("parse_page_range: None spec -> None (all pages)",

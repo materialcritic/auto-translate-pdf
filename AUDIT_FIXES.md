@@ -1238,7 +1238,7 @@ future layout regressions grep-able instead of silent.
 rendered at 0.42x -- measure_height disagreed with the actual render"`; a
 normal, correctly-sized render reports nothing.
 
-### 12. P2 — the truncation heuristic compared characters against tokens — Fixed (by inspection; no real model/tokenizer here to exercise it)
+### 12. P2 — the truncation heuristic compared characters against tokens — Fixed + verified
 
 `len(out) > max_tokens * 2` compares a **character** count against a
 **token** budget; at ~4 chars/token, `* 2` fires around 50% of budget, not
@@ -1249,6 +1249,19 @@ compares against `max_tokens * TRUNCATION_BUDGET_FRAC` (0.9) directly,
 removing the character-based estimate entirely for the normal case; falls
 back to a named `CHARS_PER_TOKEN` (4) estimate only if `encode()` itself
 raises.
+
+**Verified**, after initially being marked "by inspection" only:
+extracted the whole truncation-detection block out of `translate()` (which
+imports `mlx_lm` for real and can't be exercised without an actual model)
+into a standalone `check_truncation(tokenizer, german_text, out,
+max_tokens, report)`, callable with a stub tokenizer whose `encode()`
+approximates real BPE behavior (~1 token/word, plus one per punctuation
+mark, not `CHARS_PER_TOKEN`'s own ratio, so the test doesn't just
+reconstruct the same estimate it's meant to replace). Four cases in
+`tests/test_units.py`: a real near-budget unfinished output is flagged; the
+same output isn't when `max_tokens` leaves headroom; an output that itself
+ends in punctuation isn't flagged even near budget; and no check fires at
+all when the source didn't end in punctuation either.
 
 ### 13. P2 — no packaging; tests are hand-rolled scripts — Fixed (both cheap wins)
 
@@ -1294,12 +1307,15 @@ at all.
 
 ---
 
-All 14 of Round 5's findings are addressed: 12 fixed and verified, 1 fixed
-by inspection only (12, needs a real tokenizer to exercise), and 1
-documented rather than implemented (5, bold support -- explicitly offered
-as a legitimate alternative to a meaningfully larger, riskier change).
-Finding 6 (dead `font` field) was fixed by deletion rather than by
-implementing font fidelity, also per the audit's own offered alternative.
+All 14 of Round 5's findings are addressed: 13 fixed and verified (12 was
+initially marked "by inspection only" for lack of a real tokenizer here,
+then later given a proper extraction + stub-tokenizer test -- see its
+updated entry above), and 1 documented rather than implemented (5, bold
+support -- explicitly offered as a legitimate alternative to a
+meaningfully larger, riskier change; **still open as of this writing**,
+tracked in "What's still open" below). Finding 6 (dead `font` field) was
+fixed by deletion rather than by implementing font fidelity, also per the
+audit's own offered alternative.
 
 ---
 
@@ -1363,3 +1379,21 @@ caught by running `--reformat-only` for 7+ successive passes on a
 synthetic fixture and confirming the output geometry/line-count stayed
 exactly stable, not just "close enough" -- the same idempotency-testing
 approach Round 5 Finding 3 established.
+
+---
+
+## What's still open
+
+- **Bold support (Round 5 Finding 5).** Bold text still renders as italic
+  or plain, and the model's own `**bold**` output still collapses to
+  *italic*. Documented in README's "Known limitations" as a deliberate
+  cheaper alternative to implementing it, per the audit's own offer -- not
+  attempted yet, tracked here in case that decision is revisited.
+- **Cross-column paragraph continuation (`LAYOUT_SUPPORT.md` Phase 6).** A
+  paragraph that starts at the bottom of one column and continues at the
+  top of the next is still translated as two disconnected fragments, each
+  without the other's context. The plan itself calls this "the one
+  genuinely hard problem" and the only part of the whole design that could
+  make output *worse* than today without dedicated verification -- meant
+  to ship behind a flag (`--join-columns`) defaulted off, only once
+  trusted. Not attempted yet.
