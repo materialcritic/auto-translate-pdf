@@ -597,10 +597,11 @@ The audit's second note on this notebook — that `AutoModelForCausalLM` +
 `AutoTokenizer` isn't the model card's documented loader for a Gemma-3-
 derived checkpoint (the tagged loader is `Gemma3ForConditionalGeneration` +
 `AutoProcessor`, with `Gemma3ForCausalLM` for a text-only load that omits
-the vision tower) — has **not** been separately verified or applied. Flagged
-here as still open if the notebook needs revisiting; the audit itself
-couldn't run this (no GPU on that machine) and called it "the documented
-path to verify rather than a tested fix."
+the vision tower) — has **not** been separately verified or applied, and
+the audit itself couldn't run this (no GPU on that machine) and called it
+"the documented path to verify rather than a tested fix." **Won't fix**:
+the Colab notebook isn't planned for further work, so this is closed
+without action rather than left open indefinitely.
 
 ### 10. Low — watcher never retranslates a replaced file — Fixed + verified
 
@@ -621,31 +622,151 @@ old path-only key; it correctly re-evaluated the file under its new
 existing output, and marked it done under the new key -- confirming both
 the new key format works and the degrade-gracefully behavior holds.
 
+All 10 of Round 3's findings are applied in commit `b896273` "Fix all 10
+findings from third-party audit round 3".
+
 ---
 
-## What's still open
+## Round 2 leftovers — minor/non-blocking items, now actioned
 
-- **Finding 9's loader concern** (Colab notebook's `AutoModelForCausalLM`
-  vs. the model card's documented `Gemma3ForConditionalGeneration` +
-  `AutoProcessor`) — not verified; no GPU available to test it here either.
-- **Minor/non-blocking items from Round 2's follow-up** that were listed but
-  not actioned: adjacent italic runs merging cosmetically
-  (`'*Marx* *Engels*'` → one combined `<i>` run instead of two — renders
-  identically, purely cosmetic), `wait_until_stable`'s first-poll always
-  costing ~2s even for a long-stationary file, a 0-byte file polling for
-  the full 120s timeout on every trigger without burning an attempt, a
-  copy slower than that same 120s timeout stranding a file with nothing to
-  retrigger it, the FATAL-import path not writing to the CSV log, a
-  `.part` file surviving a hard kill as harmless clutter, an `# noqa: E402`
-  documentation nit for the deliberately-ordered `hf_transfer` env var, and
-  `output_path` preserving the original `.pdf`/`.PDF` case.
-- **The two "worth adding regardless" items from Round 1**, still not
-  built: a golden-file regression test (`skip_translation=True` gives a
-  fully deterministic path through extraction/reflow/rendering with no
-  model load — several of the bugs above would have been caught by one
-  such fixture) and a `--check` mode reporting paragraph count/detected
-  body size/modal margin/near-empty-paragraph count without translating.
-All 10 of Round 3's findings are now applied. Unlike Rounds 1 and 2 (commits
-`7a91255` and `4090c49`), Round 3's commit hash isn't filled in above since
-it's written before that commit is made — check `git log` for the actual
-hash if this file is read after the fact.
+These eight items were listed after Round 2's follow-up but not acted on at
+the time (see "What's still open" as it read through Round 3). None were
+regressions or user-facing correctness bugs on their own — that's why they
+sat for two rounds — but each was cheap to fix once picked back up.
+
+1. **Adjacent italic runs merged cosmetically.** `text_to_html`'s pass to
+   drop "empty" runs left over from `**bold**` normalization
+   (`re.sub(r"\*(\s*)\*", r"\1", text)`) couldn't tell an empty run from the
+   ordinary word-gap between two separate real runs — `'*Marx* *Engels*'`
+   has a `"* *"` sequence at the boundary between them, identical in shape
+   to an emptied-out `"**  **"`. The regex collapsed both, merging
+   `'*Marx* *Engels*'` into one `<i>Marx Engels</i>` run.
+   **Fix:** removed the pass entirely. It turned out to be unnecessary: an
+   empty/whitespace-only run can never match `ASTERISK_RUN_RE` in the first
+   place (its opening `*` must be followed by a non-space character), so a
+   leftover `"*  *"` already falls through to `esc()`'s unmatched-delimiter
+   drop with no extra step needed.
+   **Verified:** `text_to_html('*Marx* *Engels*')` → `'<i>Marx</i>
+   <i>Engels</i>'` (previously one merged run); `'**Dialektik**'` and the
+   `'das *Kapital* von Marx'` mid-sentence case are both unaffected;
+   `'a **  ** b'` (the case the old pass targeted) still renders as plain
+   `'a    b'` with no empty `<i>` tag.
+
+2. **`wait_until_stable`'s first poll always cost ~2s**, even for a file
+   that had been sitting untouched for hours. **Fix:** a fast path checks
+   the file's mtime before polling at all — if it's already older than
+   `checks * interval`, the file is stable by definition and the function
+   returns immediately. **Verified:** a file backdated 30s returned `True`
+   in 0.00s (vs. a guaranteed ~2s before).
+
+3. **A 0-byte file polled for the full 120s timeout on every single
+   trigger**, since size 0 can never satisfy the "unchanged and > 0"
+   stability check. **Fix:** added a separate, much shorter
+   `zero_byte_timeout` (5s default) that a stuck-at-zero file hits and
+   bails out on well before the main timeout. **Verified:** a permanently
+   0-byte file now returns `False` in ~2s instead of 120s.
+
+4. **A copy slower than the 120s stability timeout stranded its file
+   indefinitely** — a Folder Action fires only on "item added," so once
+   `wait_until_stable` gives up, nothing triggers this script again for
+   that file until some *other* file is dropped in the folder. **Fix:**
+   `schedule_retry()` spawns a detached, self-relaunching background
+   process (`sleep 150 && exec python3 auto_translate_pdf.py`) whenever a
+   file is still copying at the end of a run, deduplicated via a
+   `.auto_translate_retry_pending` marker file so a busy folder doesn't
+   spawn a pile of them; the marker clears once a run finds nothing left
+   waiting on stability.
+
+5. **The FATAL-import path didn't write to the CSV log.** If
+   `from translate_pdf import ...` failed (e.g. no serif font pair on this
+   machine), the failure went to stdout and the progress log but never to
+   `translate_log.csv` — the one place a user would think to check.
+   **Fix:** added the missing `log_result(...)` call on that path.
+
+6. **A `.part` file survives a hard kill as harmless-but-permanent
+   clutter.** `process_pdf` already saves to `<output>.part` and renames on
+   success specifically so a *normal* failure never leaves a corrupt file
+   behind, but a hard kill (force-quit, `kill -9`, a crashed process) skips
+   the rename and leaves the `.part` file sitting in the folder forever.
+   **Fix:** `cleanup_stale_part_files()` removes any leftover `*.part` file
+   at the start of every run — safe because it only runs while holding
+   `LOCK_FILE`, so any `.part` file found there cannot belong to a
+   still-running translation.
+
+7. **An `# noqa: E402` documentation nit.** `import pymupdf as fitz` sits
+   after the `HF_XET_HIGH_PERFORMANCE` `os.environ.setdefault()` call
+   deliberately (it must run before `huggingface_hub` is imported), which
+   is a textbook E402 lint flag with no comment explaining why it's there
+   on purpose. **Fix:** added the `# noqa: E402` plus a comment pointing at
+   the ordering requirement.
+
+8. **`output_path` and the original file's `.pdf`/`.PDF` case.** Verified
+   this was already correct — `p.with_name(f"{p.stem}{EN_SUFFIX}{p.suffix}")`
+   uses `p.suffix`, which preserves the source extension's case verbatim
+   (`Bericht.PDF` → `Bericht_en.PDF`). The actual gap was the module
+   docstring, which described the output as always `<name>_en.pdf`
+   (implying a fixed lowercase extension); corrected it to describe the
+   real, case-preserving behavior.
+
+All eight are in `scripts/auto_translate_pdf.py` except #1 and #7, which are
+in `translate_pdf.py`.
+
+---
+
+## The two Round 1 "worth adding regardless" items, now built
+
+1. **A golden-file regression test** (`tests/test_golden.py` +
+   `tests/fixtures.py`). Builds a synthetic fixture PDF exercising the
+   trickier corners of the pipeline in one page — indentation-based
+   paragraph splitting, a real italic run sitting next to a literal
+   asterisk, two back-to-back footnote entries distinguishable only by
+   their leading marker (Finding 3), one of them hyphenated across a line
+   break (Finding 5), and a footer folio (Round 2's pinning fix) — and runs
+   it through `process_pdf` with `load_model`/`translate` monkeypatched to
+   stubs (an identity function standing in for translation). No model
+   download, no GPU/Apple Silicon dependency, no non-determinism from an
+   actual LLM — the same technique Round 3's own audit used to build its
+   test harness. Assertions are deliberately split across two views: what
+   was *sent to `translate()`* (proves the source-side paragraph-splitting/
+   marker/hyphenation decisions, captured via the stub) vs. what actually
+   *ended up in the rendered output* (proves italics, the literal asterisk,
+   and the folio's position survived rendering) — re-parsing the rendered
+   output to check paragraph-splitting doesn't work, because by then
+   footnote markers are just plain same-size inline text and the marker-
+   based split signal has nothing left to key off, which is expected
+   output-side behavior, not a regression.
+
+   Sanity-checked the harness actually catches regressions by temporarily
+   disabling Finding 3's `starts_with_marker` check and re-running: the
+   "sent as separate translate() calls" assertion correctly failed, showing
+   both footnote entries merged into one call, exactly the Finding 3 bug.
+   Restored before landing.
+
+   One fixture-construction wrinkle worth noting for anyone extending this
+   test: the footnote lines are placed with low-level `page.insert_text()`
+   rather than `insert_htmlbox()`, because `insert_htmlbox` itself silently
+   rewrites a literal `"-"` at a line break into an invisible soft hyphen
+   (U+00AD) — a real rendering quirk (already handled via the `"\xad"` ->
+   `"-"` normalization in `split_page_into_paragraphs`, for when this
+   pipeline re-extracts its *own* prior output), but one that would corrupt
+   a fixture meant to simulate a genuine source PDF with a real ASCII
+   hyphen. `insert_text()` places literal glyphs with no such rewrite.
+
+2. **A `--check` mode**: `translate_pdf.py input.pdf --check` reports, per
+   page, the paragraph count, detected body font size, modal left margin,
+   and near-empty-paragraph count — without loading the model, translating,
+   or writing any output. `output` is no longer a required positional
+   argument when `--check` is passed. Implemented via a new
+   `modal_left_margin()` helper factored out of
+   `split_page_into_paragraphs` (so the diagnostic and the real
+   paragraph-splitting logic can never quietly drift apart) and a new
+   `check_pdf()` function that reuses `split_page_into_paragraphs` directly.
+   **Verified** against the golden fixture: `1 page: 6 paragraph(s), body
+   size 14.0, modal left margin 72.0, 1 near-empty` — matching the fixture's
+   known contents (heading, 2 body paragraphs, 2 footnote entries, 1 folio;
+   the folio is the near-empty one).
+
+Nothing else is open: all findings from Rounds 1–3 are fixed and verified,
+the Round 2 leftovers above are fixed and verified, and both Round 1
+"worth adding regardless" items are built. Finding 9's loader concern
+(above) is the one item closed as won't-fix rather than fixed.

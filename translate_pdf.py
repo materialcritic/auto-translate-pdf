@@ -29,7 +29,11 @@ import sys
 # load` -- hence setting it here, at module load.
 os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 
-import pymupdf as fitz  # `import fitz` is deprecated as of PyMuPDF 1.24+
+import pymupdf as fitz  # noqa: E402 -- `import fitz` is deprecated as of PyMuPDF
+# 1.24+; this import is deliberately placed after the HF_XET_HIGH_PERFORMANCE
+# os.environ.setdefault() above (it must run before huggingface_hub is
+# imported), not left here by oversight -- hence the noqa rather than
+# reordering to satisfy the linter.
 
 DEFAULT_MODEL = "mlx-community/translategemma-4b-it-4bit"
 
@@ -252,6 +256,14 @@ def join_paragraph_lines(pieces, dehyphenate=True):
     return out
 
 
+def modal_left_margin(lines):
+    """The x0 shared by more lines than any other on the page -- i.e. the
+    body-text left margin, used both to detect paragraph indentation here
+    and as a `--check`-mode diagnostic (see check_pdf)."""
+    x0s = [round(l["bbox"][0], 1) for l in lines]
+    return max(set(x0s), key=x0s.count)
+
+
 def split_page_into_paragraphs(blocks, left_margin_tolerance=4.0, gap_multiplier=1.7,
                                 dehyphenate=True):
     """
@@ -286,7 +298,7 @@ def split_page_into_paragraphs(blocks, left_margin_tolerance=4.0, gap_multiplier
     lines.sort(key=lambda l: (round(l["bbox"][1], 1), l["bbox"][0]))
 
     x0s = [round(l["bbox"][0], 1) for l in lines]
-    margin = max(set(x0s), key=x0s.count)  # modal left margin = body text
+    margin = modal_left_margin(lines)
     page_dominant_size = dominant_size(lines)
 
     def body_size_of_line(line):
@@ -473,8 +485,19 @@ def text_to_html(text):
     # runs of 2+ asterisks to one before parsing, or "**Dialektik**" becomes
     # "<i>*Dialektik</i>*" -- a stray literal "*" plus an italic run that
     # starts one character early.
+    #
+    # There used to be a second pass here collapsing "*<whitespace>*" to
+    # drop "empty" runs left behind by the line above (e.g. "**  **" ->
+    # "*  *"). But that pattern is indistinguishable from two genuinely
+    # separate italic runs separated by an ordinary word gap -- "*Marx*
+    # *Engels*" also contains a "*" + space + "*" at the boundary between
+    # them, so the collapse silently merged the two into one run spanning
+    # "Marx Engels". It's unnecessary anyway: ASTERISK_RUN_RE already
+    # requires its opening "*" to be followed by a non-space character, so
+    # a whitespace-only "run" like "*  *" never matches it in the first
+    # place and both asterisks fall through to esc()'s unmatched-delimiter
+    # drop below, with no empty <i> tag and no merging.
     text = re.sub(r"\*{2,}", "*", text)
-    text = re.sub(r"\*(\s*)\*", r"\1", text)  # drop empty runs left behind
 
     def esc(chunk):
         # Restore literal asterisks parked on the sentinel by
@@ -855,15 +878,74 @@ def parse_page_range(spec, npages):
     return pages
 
 
+def check_pdf(in_path, page_range=None, report=print):
+    """Report per-page extraction/paragraph-detection diagnostics for
+    `in_path` without loading the model or translating anything -- lets you
+    sanity-check how the heuristics in split_page_into_paragraphs are
+    reading an unfamiliar document (garbled paragraph counts, a
+    suspiciously large near-empty count, a modal margin that doesn't match
+    the visible body text) before committing to a full, slow, model-backed
+    run. `report` receives each output line (print by default; tests pass
+    something else to capture it).
+
+    Returns the list of per-page stat dicts, for programmatic use (e.g. the
+    golden-file regression test asserts against these instead of scraping
+    printed text).
+    """
+    doc = fitz.open(in_path)
+    try:
+        page_indices = range(len(doc)) if page_range is None else page_range
+        all_stats = []
+        for pno in page_indices:
+            page = doc[pno]
+            d = page.get_text("dict")
+            blocks = [b for b in d["blocks"] if b["type"] == 0]
+            lines = [l for b in blocks for l in b["lines"] if l["spans"]]
+            paragraphs = split_page_into_paragraphs(blocks)
+
+            near_empty = 0
+            for para in paragraphs:
+                # Same "nothing real to translate" test process_pdf uses to
+                # decide whether a paragraph is worth sending to the model.
+                core = FOOTNOTE_MARKER_RE.sub("", para["text"]).replace("*", "").strip()
+                if len(core) < 4:
+                    near_empty += 1
+
+            sizes = [p["size"] for p in paragraphs]
+            stats = {
+                "page": pno + 1,
+                "paragraphs": len(paragraphs),
+                "body_size": max(sizes) if sizes else None,
+                "modal_margin": modal_left_margin(lines) if lines else None,
+                "near_empty": near_empty,
+            }
+            all_stats.append(stats)
+            report(
+                f"page {stats['page']}: {stats['paragraphs']} paragraph(s), "
+                f"body size {stats['body_size']}, "
+                f"modal left margin {stats['modal_margin']}, "
+                f"{stats['near_empty']} near-empty"
+            )
+        return all_stats
+    finally:
+        doc.close()
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("input")
-    ap.add_argument("output")
+    ap.add_argument("output", nargs="?", default=None,
+                     help="required unless --check is given")
     ap.add_argument("--pages", default=None, help="e.g. 1-5 or 1,3,5")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--reformat-only", action="store_true",
                      help="re-lay-out an already-English PDF without translating "
                           "(see 'Reformat-only mode' in the README)")
+    ap.add_argument("--check", action="store_true",
+                     help="report paragraph count/detected body size/modal margin/"
+                          "near-empty-paragraph count per page, without translating "
+                          "or writing any output (see 'Sanity-checking a document' "
+                          "in the README)")
     args = ap.parse_args()
 
     doc = fitz.open(args.input)
@@ -874,8 +956,13 @@ if __name__ == "__main__":
     except ValueError as e:
         ap.error(str(e))
 
-    process_pdf(
-        args.input, args.output,
-        None if args.reformat_only else args.model,
-        page_range, skip_translation=args.reformat_only,
-    )
+    if args.check:
+        check_pdf(args.input, page_range)
+    else:
+        if not args.output:
+            ap.error("output is required unless --check is given")
+        process_pdf(
+            args.input, args.output,
+            None if args.reformat_only else args.model,
+            page_range, skip_translation=args.reformat_only,
+        )

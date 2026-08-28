@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Watches ~/Translate and automatically translates any PDF dropped there from
-German to English, producing "<name>_en.pdf" alongside the original (which is
-left untouched), preserving layout via translate_pdf.py (TranslateGemma 4B,
-run locally through mlx-lm).
+German to English, producing "<name>_en<ext>" alongside the original (which is
+left untouched, extension case preserved -- a "Bericht.PDF" input produces
+"Bericht_en.PDF", not "Bericht_en.pdf"), preserving layout via
+translate_pdf.py (TranslateGemma 4B, run locally through mlx-lm).
 
 This script is meant to be triggered automatically (e.g. via a macOS Folder
 Action) every time a file is added to the folder, but it's also safe to just
@@ -17,6 +18,7 @@ from __future__ import annotations
 import csv
 import fcntl
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -28,6 +30,8 @@ MAX_ATTEMPTS = 3  # give up on a file after this many failed runs
 STATE_FILE = FOLDER / ".auto_translate_state.json"
 LOG_FILE = FOLDER / "translate_log.csv"
 PROGRESS_FILE = FOLDER / ".translate_progress.log"
+RETRY_MARKER = FOLDER / ".auto_translate_retry_pending"
+RETRY_DELAY = 150.0  # seconds; comfortably longer than wait_until_stable's 120s timeout
 
 LOCK_FILE = Path.home() / "Library" / "Application Support" / "auto_translate_pdf.lock"
 
@@ -80,6 +84,10 @@ def log_result(name: str, output_name: str, status: str) -> None:
 
 
 def output_path(p: Path) -> Path:
+    # p.suffix preserves the original extension's case verbatim (".PDF" in,
+    # ".PDF" out) -- only the inserted "_en" is always lowercase, so a
+    # scanner export like "Bericht.PDF" becomes "Bericht_en.PDF", not
+    # "Bericht_en.pdf".
     return p.with_name(f"{p.stem}{EN_SUFFIX}{p.suffix}")
 
 
@@ -105,20 +113,44 @@ def progress(line: str) -> None:
 
 
 def wait_until_stable(p: Path, checks: int = 2, interval: float = 1.0,
-                       timeout: float = 120.0) -> bool:
+                       timeout: float = 120.0, zero_byte_timeout: float = 5.0) -> bool:
     """True once p's size has been unchanged for `checks` consecutive polls.
 
     A Folder Action fires on "item added", which for a large file or a
     network/AirDrop copy can precede the last byte landing -- opening the
     file then yields a truncated PDF and burns a retry attempt on a file
     that was never actually broken."""
+    try:
+        st = p.stat()
+    except FileNotFoundError:
+        return False
+
+    # Fast path: a file whose last write already happened comfortably in
+    # the past (e.g. one that finished copying seconds before this trigger
+    # fired, or a long-stationary file re-checked on a later run) doesn't
+    # need to pay the full `checks * interval` polling cost just to prove
+    # what its mtime already shows -- nothing has touched it recently.
+    if st.st_size > 0 and time.time() - st.st_mtime > interval * checks:
+        return True
+
     deadline = time.monotonic() + timeout
-    last, stable = -1, 0
+    last, stable, zero_since = st.st_size, 0, (time.monotonic() if st.st_size == 0 else None)
     while time.monotonic() < deadline:
         try:
             size = p.stat().st_size
         except FileNotFoundError:
             return False
+        if size == 0:
+            # A 0-byte file that never grows (a placeholder created before
+            # writing starts, or a genuinely empty/broken drop) will never
+            # satisfy the stability check below -- without this, every
+            # trigger burns the *entire* 120s timeout on it for nothing.
+            # Give it a much shorter window to start growing before bailing.
+            zero_since = zero_since or time.monotonic()
+            if time.monotonic() - zero_since >= zero_byte_timeout:
+                return False
+        else:
+            zero_since = None
         if size == last and size > 0:
             stable += 1
             if stable >= checks:
@@ -128,6 +160,49 @@ def wait_until_stable(p: Path, checks: int = 2, interval: float = 1.0,
         last = size
         time.sleep(interval)
     return False
+
+
+def cleanup_stale_part_files() -> None:
+    """Remove any leftover "*.part" temp file at the start of a run.
+
+    translate_pdf.py saves to "<output>.part" and renames it to the final
+    name only on success, specifically so a mid-run failure never leaves a
+    corrupt/partial file that out.exists() would mistake for a completed
+    translation. But a *hard* kill (force-quit, `kill -9`, a crashed
+    process) skips that rename entirely and leaves the ".part" file
+    sitting in the folder forever as harmless-but-permanent clutter. Since
+    we're only ever called while holding LOCK_FILE, any ".part" file found
+    here cannot belong to a still-running translation -- it's necessarily
+    stale."""
+    for part in FOLDER.rglob("*.part"):
+        try:
+            part.unlink()
+            print(f"  removed stale partial file: {part.relative_to(FOLDER)}")
+        except OSError:
+            pass
+
+
+def schedule_retry() -> None:
+    """Spawn a detached process that re-invokes this script after a delay.
+
+    A Folder Action fires only on "item added" -- if wait_until_stable()
+    times out on a copy slower than its own 120s window, nothing will ever
+    trigger this script again for that file until some *other* file is
+    dropped in the folder. Left alone, a single slow copy can strand
+    itself indefinitely. RETRY_MARKER de-dupes: only one retry is ever
+    outstanding at a time, so a busy folder doesn't spawn a growing pile of
+    them (the marker is cleared once a run completes with nothing left
+    waiting on stability)."""
+    if RETRY_MARKER.exists():
+        return
+    RETRY_MARKER.write_text(str(time.time()))
+    script = str(Path(__file__).resolve())
+    subprocess.Popen(
+        ["/bin/sh", "-c", f"sleep {RETRY_DELAY} && exec {sys.executable!r} {script!r}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    print(f"  scheduled a retry in {RETRY_DELAY:.0f}s for the still-copying file(s)")
 
 
 def main():
@@ -151,6 +226,7 @@ def main():
 
 def _main():
     FOLDER.mkdir(parents=True, exist_ok=True)
+    cleanup_stale_part_files()
     state = load_state()
     done = set(state["done"])
     attempts = state["attempts"]
@@ -189,8 +265,14 @@ def _main():
     except Exception as e:
         print(f"FATAL: cannot import translate_pdf: {e}")
         progress(f"FATAL: cannot import translate_pdf: {e}")
+        # Every other failure path in this loop calls log_result() so it
+        # shows up in translate_log.csv -- this one didn't, so a broken
+        # environment (e.g. no serif font pair on this machine) silently
+        # skipped the one record a user checking the log would look for.
+        log_result("", "", f"fatal: cannot import translate_pdf: {e}")
         return
 
+    still_copying = False
     for p in pending:
         key = file_key(p)
         out = output_path(p)
@@ -204,6 +286,7 @@ def _main():
 
         if not wait_until_stable(p):
             print(f"  {key}: still being written, skipping this pass")
+            still_copying = True
             continue  # no attempt burned; the next trigger picks it up
 
         print(f"  translating: {key}")
@@ -233,6 +316,14 @@ def _main():
         done.add(key)
         attempts.pop(key, None)
         commit()
+
+    if still_copying:
+        schedule_retry()
+    else:
+        # Nothing left waiting on stability -- clear the marker so a future
+        # slow copy is free to schedule its own retry rather than finding
+        # a stale marker from a batch that has since finished.
+        RETRY_MARKER.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

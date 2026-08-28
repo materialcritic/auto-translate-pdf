@@ -148,8 +148,13 @@ extraction/reflow/rendering steps — no model load, no translation calls. Use
 this for a pure formatting fix on an existing output (e.g. after a gap-math
 or rendering bug fix lands, to fix a file translated before the fix without
 paying for a fresh translation, which would also introduce fresh
-non-determinism into text that was already correct). There's no CLI flag for
-it yet; call `process_pdf` directly, e.g.:
+non-determinism into text that was already correct):
+
+```bash
+./venv/bin/python translate_pdf.py in_en.pdf out_en.pdf --reformat-only
+```
+
+or, calling `process_pdf` directly:
 
 ```python
 import sys; sys.path.insert(0, ".")
@@ -175,6 +180,41 @@ Two things only matter in this mode:
   with more (short) footnote paragraphs than (long) body paragraphs would
   otherwise make the footnote size look like "the body size" by paragraph
   count alone.
+
+## Sanity-checking a document (`--check`)
+
+```bash
+./venv/bin/python translate_pdf.py input.pdf --check
+```
+
+Reports, per page, the paragraph count, the detected body font size, the
+modal left margin, and the near-empty-paragraph count — the same signals
+`split_page_into_paragraphs`/`process_pdf` use internally — without loading
+the model, translating anything, or writing any output. Useful for sanity-
+checking how those heuristics are reading an unfamiliar document before
+committing to a full, slow, model-backed run: a paragraph count wildly out
+of proportion to the page's visible content, a near-empty count that's
+suspiciously high, or a modal margin that doesn't match the visible body
+text all point at the same handful of extraction assumptions (see "How the
+translation pipeline works" above) not fitting this particular PDF's layout.
+`output` isn't required in this mode.
+
+## Testing
+
+`tests/test_golden.py` is a golden-file regression test: it builds a
+synthetic fixture PDF (see `tests/fixtures.py`) exercising the trickier
+corners of the pipeline — footnote-marker splitting, hyphenation across a
+line break, a literal asterisk next to a real italic run, and a
+page-anchored folio — and runs it through `process_pdf` with `load_model`/
+`translate` stubbed out (no model download, no GPU/Apple Silicon needed, no
+non-determinism from an actual LLM). Run it directly:
+
+```bash
+./venv/bin/python tests/test_golden.py
+```
+
+No test framework dependency; it prints PASS/FAIL per check and exits
+non-zero if anything fails.
 
 ## Known limitations
 
