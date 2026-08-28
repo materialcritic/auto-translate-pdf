@@ -358,65 +358,269 @@ resolution, which differs by machine):
   quick succession queues them (via a lock file) rather than running
   translations in parallel, so as not to fight over memory/model reloads.
 
+## Project history
+
+This project has gone through five rounds of external audit plus one large
+feature addition (layout support). What follows is a complete summary of
+what changed and why, newest first; `AUDIT_FIXES.md` is the full,
+unabridged record — every finding, the exact fix, and how each one was
+verified (often with the specific before/after numbers from a reproduced
+bug) — for anyone who wants the detail this summary necessarily compresses.
+
+### Layout support: multi-column, images, tables
+
+The single largest addition after the initial publish. A new `layout.py`
+module gives the pipeline a region layer between "page" and "paragraph":
+
+```
+page
+ ├── regions[]     ordered flow areas: a column, a spanning heading, a table
+ └── obstacles[]   images, vector figures — text never flows into these
+```
+
+`translate_pdf.py`'s paragraph-splitting, reflow, and redaction were
+refactored to operate per-region instead of per-page. A single-column,
+figure-free, table-free page — most of the documents this pipeline was
+originally built for — still produces exactly one region, so nothing
+changes for that case; see "Layout support" above for the user-facing
+description of what actually improved (real multi-column translation
+instead of skip-or-`--force`, obstacle-aware reflow so text never overlaps
+a figure, per-paragraph redaction so a figure is never covered by a white
+redaction box, and cell-by-cell table translation).
+
+Two real bugs surfaced during the refactor that the original implementation
+plan didn't anticipate:
+
+- **A text region's rect from `layout.analyze_page()` is a *tight*
+  bounding box around whatever content already exists there, not the
+  space available for it to grow into.** Used directly as the fit limit,
+  any paragraph growth at all — even a sub-point rounding difference
+  between two `--reformat-only` passes — read as "region overflow" and
+  forced a rescale a single-column page never needed before this refactor,
+  breaking the reformat-only idempotency fix below all over again. Fixed
+  by deriving a separate growth-ceiling rect in `process_pdf` (the next
+  region's top, or the page's bottom margin if nothing is in the way)
+  instead of passing the analyzed region rect straight through.
+- **`page.apply_redactions(fill=(1,1,1))` bakes a solid white rectangle
+  into the page as real vector content.** On a *later* pass over this
+  pipeline's own output, the obstacle detector picked up that white-out
+  box as a "figure" the same size and position as the very paragraph it
+  covers, and then skipped redacting that area to avoid "redacting through
+  a figure" — leaving the old text underneath un-erased while new text was
+  drawn on top of it, compounding every pass (one test fixture went 18
+  lines → 36 → 46 → 78 → 140, purely from re-detecting its own prior
+  output as an obstacle). Fixed by excluding solid-white, borderless
+  drawings from obstacle detection — a real figure is essentially never
+  that.
+
+Both were caught by running `--reformat-only` for 7+ successive passes on
+a synthetic fixture and requiring the output geometry/line-count to stay
+*exactly* stable, not just "close enough" — the same rigor the reformat
+idempotency fix below established. Cross-column paragraph continuation (a
+paragraph starting at the bottom of one column and continuing at the top
+of the next) is the one deliberately unbuilt piece — the design document
+itself calls it the only part of this whole feature that could make output
+*worse* than before without dedicated verification, meant to ship behind a
+flag defaulted off, only once trusted.
+
+### Round 5: inside-paragraph fidelity and reformat idempotency
+
+Two P0/P1-level findings one level deeper than earlier rounds had looked:
+
+- **A real PDF superscript footnote marker went undetected.** The marker
+  test caught small-size markers and Unicode superscript *glyphs* (¹²³),
+  but missed the much more common case of ASCII digits raised by the
+  typesetter at a real ~0.83× body size — landing in the dead zone between
+  the two checks. Result: `"1938"` + superscript `"1"` fused into
+  `"19381"` before the footnote-marker-preservation logic ever saw it,
+  corrupting a year. Fixed by also checking PyMuPDF's own superscript flag
+  (`flags & 1`).
+- **The source's line leading (spacing between lines) was never
+  reproduced** — every paragraph re-rendered at a fixed 1.2× font-size
+  regardless of the source's actual leading, off by as much as 22% of a
+  paragraph's height for a document set looser than that, and able to
+  trigger a spurious font-rescale on a page whose *text never changed at
+  all*. Fixed by measuring the source's own leading as a ratio to font
+  size and re-emitting it via CSS's unitless `line-height`, which scales
+  automatically with any later font-size adjustment.
+- **`--reformat-only` was not idempotent — each pass grew the page.**
+  Traced past the audit's own initial diagnosis (a small fixed padding
+  constant) to a deeper mechanism: the paragraph-height figure fed into
+  the next-paragraph-position calculation was a few points taller than the
+  glyph-only extent a later re-extraction would actually see, so each
+  reformat pass's own rendering became a slightly-inflated "original" gap
+  for the next pass to preserve and then inflate again. Fixed by measuring
+  both a safe render height and the true glyph-tight height, and using the
+  tight one for position bookkeeping. Verified to be genuinely
+  bit-for-bit stable across 5+ repeated reformat passes, not just "close."
+- Also fixed: a translation-refusal detector that flagged ordinary German
+  prose translating to "Please…"/"Sorry…"/"I cannot…"; length-ratio checks
+  on translation plausibility with no minimum-length floor (false-flagging
+  short compound-word headings); a measure/render disagreement that could
+  silently shrink a paragraph with no warning; a truncation heuristic that
+  compared characters against a token budget; the watcher's retry marker
+  being permanently strandable by a crash; CI not running one of the three
+  test files; `--temp`/`--seed` being undocumented; a dead `font` field
+  implying font fidelity that doesn't exist (deleted, documented as a
+  limitation instead); and a missing rotated-page (`/Rotate 90`) test.
+  Bold-text support was evaluated and deliberately deferred (documented as
+  a known limitation) rather than implemented, as a meaningfully larger
+  and riskier change than anything else in this round.
+
+### Round 4: layout-correctness cluster and watcher hardening
+
+- **The overflow/clipping warning never reached anyone on the plain CLI.**
+  `report()` only ever called an optional progress callback the CLI itself
+  never passed, so every overflow/rescale warning was computed and
+  silently discarded outside the Folder Action watcher. Now always writes
+  to stderr too.
+- **Reflowed body text could grow straight through a pinned page folio**,
+  and **only bare-digit paragraphs were ever page-anchored** — a textual
+  running head ("Kapitel 3 – Einleitung") rode the reflow chain like
+  ordinary body text and inherited the body's accumulated shift, the same
+  class of regression Round 2 had already fixed for folios specifically.
+  Both fixed by deciding page-anchoring on geometry for every paragraph,
+  and by deriving the page-fit limit from the nearest pinned item rather
+  than the page box alone.
+- **First-line indent was dropped entirely** — the pipeline's own
+  paragraph-splitting relies on indentation as its primary signal, but the
+  indent was consumed for detection and then never re-emitted, so two
+  indent-separated source paragraphs read as one continuous block in the
+  translated output. Fixed by recording and re-emitting it via CSS
+  `text-indent`.
+- **`join_paragraph_lines` lost italics when a hyphenated word broke
+  across an italic line pair** in the one branch (proper nouns, page
+  ranges) that hadn't gotten the same-run merge guard its three sibling
+  branches already had.
+- Multi-column pages are **detected** (not yet given real reflow support
+  until the layout-support work above) and translation of a flagged page
+  is skipped rather than scrambled, with a warning; input is validated
+  before the ~2GB model load (encrypted PDFs, image-only scans that would
+  otherwise silently produce an untouched "translated" file); the
+  watcher no longer crashes if a pending file disappears mid-run; a shell-
+  injection-shaped bug in the watcher's retry scheduling was fixed by
+  dropping the shell entirely; the literal-asterisk sentinel no longer
+  travels through the LLM itself, and an unmatched model-emitted asterisk
+  now renders literally instead of being silently deleted; `measure_height`
+  gained an LRU cache (~215× speedup on repeated measurements); watcher
+  state moved out of the watched folder (a Folder Action fires on *any*
+  item added, including the watcher's own bookkeeping files); `mlx-lm`
+  split into an optional dependency so `--check`/`--reformat-only`/the
+  test suite run on any machine, no Apple Silicon required; and CI was
+  added.
+
+### Round 3: a synthetic-PDF test harness catches the first silent-corruption class
+
+The first round to build and use a repeatable test fixture rather than
+auditing by inspection alone, and the round that found the project's
+first genuinely silent (no warning, no error) data-loss bug:
+
+- **Translated text overflowing the page bottom was silently
+  invisible** — `insert_htmlbox` only ever reports whether text fits the
+  *rect* it's given, never whether that rect is still on the page, so
+  once English ran long enough to push a paragraph's rect past the media
+  box, the excess simply vanished with no error and no warning. In the
+  audit's own worst case, 73% of a page's translated content was lost this
+  way. Fixed with a two-stage fit: shrink inter-paragraph gaps first, then
+  scale the page's type down as a last resort, reporting a warning if even
+  that isn't enough (clipped-but-flagged, never silently dropped).
+- **Footnote/reference paragraphs rendered at their superscript marker's
+  tiny size**, because the paragraph's font size was read from the first
+  span of the first line — exactly the marker for a footnote entry, not
+  the entry's own body text. Fixed by using the size covering the most
+  *characters* in the paragraph instead.
+- **Consecutive footnote/reference entries merged into one run-on
+  paragraph** — none of the existing paragraph-break signals (indent, size
+  jump, gap) fire between two footnote-list entries at the same margin,
+  same size, one after another. Fixed by adding "starts with a footnote
+  marker" as its own paragraph-break signal.
+- Also fixed: a literal asterisk (German birth-date usage, `* 1903`;
+  arithmetic, `2 * 4`) opening a bogus italic run extending to the next
+  asterisk anywhere in the paragraph, fixed by parking literal asterisks on
+  a private-use sentinel before the model call and restoring them at
+  render time; `--reformat-only` inserting a space at every hyphen break
+  (the correct de-hyphenation rule for the *translate* path is the wrong
+  rule for re-extracting this pipeline's own output, where a hyphen is
+  always real); Unicode superscript footnote markers (`¹²³`) being
+  unrecoverable because `\d` doesn't match that Unicode category; a
+  single-line paragraph's width slack being added on both sides instead of
+  just the trailing one, drifting left-aligned headings off the body
+  margin; and a fictional EOS-token safety check that could never actually
+  fire.
+
+### Round 2: a regression in the Round 1 fix, caught by a follow-up audit
+
+Fixing "bare page numbers were being deleted" (below) by making them call
+`place()` instead of being silently dropped meant a folio now joined the
+same paragraph-reflow chain as body text — but a folio is anchored to the
+*page*, not the text flow. A footer folio could land hundreds of points
+away from its real position after inheriting the body's accumulated
+shift, and a *header* folio (the first paragraph on a page) became the
+reflow chain's own anchor, shifting the entire body up by tens of points
+on every page with a running head — a strictly bigger problem than the
+one Round 1's fix had solved. Fixed by pinning any digit-only paragraph
+inside the top/bottom 12% margin band to its original position, entirely
+outside the reflow chain. Verified against both the footer-folio and
+header-folio fixtures from the follow-up report.
+
+### Round 1: the initial post-publish audit (20 findings)
+
+The first external audit, run shortly after initial publish, found:
+
+- **A phantom `2em` vertical margin on every paragraph.** The CSS reset
+  margins with a universal selector (`* { margin: 0 }`), but that has CSS
+  specificity 0 and loses to MuPDF's user-agent `p { margin: 1em 0 }` —
+  every paragraph silently carried an extra 2× its own font size in blank
+  space. This turned out to be the true root cause of two things
+  previously diagnosed separately: an "oversized gap between every
+  footnote" bug fixed even earlier in the project's own history, and a
+  title-page spacing issue that had been (wrongly) attributed to a
+  width-measurement problem. Fixed with an explicit
+  `p, div, body { margin: 0 }` rule.
+- **Bare page numbers were being deleted**, not left untranslated as
+  intended — their bbox was folded into the page-wide redaction, but the
+  `continue` that skipped translating them also skipped placing them back.
+- **De-hyphenation ran as a global regex over already-joined paragraph
+  text**, matching *any* hyphen followed by whitespace rather than only
+  one that ended a source line — corrupting ordinary German suspended
+  compounds ("Sozial- und Wirtschaftsgeschichte" → "Sozialund
+  Wirtschaftsgeschichte") and dash-as-punctuation usage, not just an edge
+  case at paragraph-merge boundaries. Rewritten to de-hyphenate at the
+  line join, where line boundaries still exist.
+- **The page-wide text redaction was also deleting embedded images**
+  (PyMuPDF's default redaction blanks image pixels intersecting the
+  redaction rect). Now scoped to text only.
+- **`fitz.Archive` ran at module import time**, so a missing font
+  directory (any non-macOS system, or a machine without these specific
+  fonts) made the whole module unimportable with a traceback that a
+  Folder Action would swallow silently. Now built lazily on first use,
+  with a fallback font list and an actionable error.
+
+Also fixed in the same round: same-row line fragments could be joined out
+of left-to-right order; the watcher now persists progress after every file
+(was: only at the end of a whole run) and doesn't retire a
+permanently-failing file into the same "done" bucket as a real success; a
+file mid-copy is no longer grabbed and burned as a false failure; several
+smaller robustness/hygiene issues (case-sensitive `.pdf` matching, a state
+file that could `KeyError` on an older schema, CSV log rows breaking on
+multi-line error text, the now-deprecated `import fitz`, and an
+`hf_transfer` dependency that never actually activated).
+
+### What's still open
+
+Two items are deliberately deferred rather than fixed, tracked in
+`AUDIT_FIXES.md`'s own "What's still open" section: **bold-text support**
+(documented as a known limitation above rather than implemented — see
+there for why) and **cross-column paragraph continuation** (Layout support
+Phase 6, above — the one part of the layout-support design flagged as
+risky enough to need its own dedicated verification before shipping,
+even behind a flag). Everything else raised across five audit rounds and
+the layout-support work has been fixed and verified; see `AUDIT_FIXES.md`
+for the full record, including the exact reproduction numbers for each bug
+and how each fix was confirmed.
+
 ## License
 
 MIT for the code in this repo. The model it downloads and runs
 (`mlx-community/translategemma-4b-it-4bit`, derived from Google's Gemma 3) is
 distributed separately under its own [Gemma license terms](https://ai.google.dev/gemma/terms).
-
-## Change history (post-publish fixes)
-
-An external audit found several real bugs after this was first published,
-most consequentially:
-
-- **A phantom `2em` vertical margin on every paragraph.** `BODY_CSS` reset
-  margins with a universal selector (`* { margin: 0 }`), but that has CSS
-  specificity 0 and loses to MuPDF's user-agent `p { margin: 1em 0 }` --
-  every paragraph silently carried an extra 2× its own font size in blank
-  space. This was the true root cause of the "oversized gap between every
-  footnote" bug fixed earlier, and of what this file previously documented
-  as a separate, unfixed "title-page heading stack" spacing bug — that
-  diagnosis (a width-measurement issue) was wrong; it was this margin all
-  along. Fixed with an explicit `p, div, body { margin: 0 }` rule.
-- **Bare page numbers were being deleted**, not left untranslated as
-  intended — their bbox was folded into the page-wide redaction, but the
-  `continue` that skipped translating them also skipped placing them back.
-- **De-hyphenation ran as a global regex over already-joined paragraph
-  text**, matching *any* hyphen followed by whitespace rather than only one
-  that ended a source line -- corrupting ordinary German suspended
-  compounds ("Sozial- und Wirtschaftsgeschichte" -> "Sozialund
-  Wirtschaftsgeschichte") and dash-as-punctuation usage, not just an edge
-  case at paragraph-merge boundaries. Rewritten to de-hyphenate at the line
-  join, where line boundaries still exist.
-- **The page-wide text redaction was also deleting embedded images**
-  (PyMuPDF's default redaction blanks image pixels intersecting the
-  redaction rect). Now scoped to text only.
-- **`fitz.Archive` ran at module import time**, so a missing font directory
-  (any non-macOS system, or a machine without these specific fonts) made
-  the whole module unimportable with a traceback that a Folder Action would
-  swallow silently. Now built lazily on first use, with a fallback font
-  list and an actionable error.
-
-Also fixed: same-row line fragments could be joined out of left-to-right
-order; the watcher now persists progress after every file (was: only at the
-end of a whole run) and doesn't retire a permanently-failing file into the
-same "done" bucket as a real success; a file mid-copy is no longer grabbed
-and burned as a false failure; several smaller robustness/hygiene issues
-(case-sensitive `.pdf` matching, a state file that could `KeyError` on an
-older schema, CSV log rows breaking on multi-line error text, the
-now-deprecated `import fitz`, and an `hf_transfer` dependency that never
-actually activated).
-
-### Follow-up: page-number regression from the first patch
-
-A second audit pass caught a regression in the page-number fix above: once
-folios started calling `place()` instead of being silently dropped, they
-joined the same reflow chain as body text — a folio is anchored to the
-*page*, not to the text flow, so inheriting the body's accumulated shift
-could move it hundreds of points, and (worse) a header folio being the
-*first* paragraph on the page made it the anchor that pushed all the body
-text below it up by tens of points on every page with a running head.
-Fixed by pinning any digit-only paragraph inside the top/bottom 12% margin
-band to its original position, entirely outside the `prev_orig_y1`/
-`prev_new_y1` chain. Verified against both the footer-folio and
-header-folio fixtures from the report.
