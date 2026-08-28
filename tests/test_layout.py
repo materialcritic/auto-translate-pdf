@@ -189,11 +189,16 @@ with tempfile.TemporaryDirectory() as d:
               any("deutscher" in "".join(s["text"] for s in l["spans"]) for l in lines))
 
 
-# --- A multi-column page must not abort the whole document: one flagged
-# --- page should be skipped (left untranslated), not lose every other
-# --- page's already-finished work. ---
+# --- LAYOUT_SUPPORT.md: a genuine multi-column page must now be
+# --- translated correctly (region-aware split/reflow), not skipped and
+# --- not zipped row-by-row into scrambled nonsense (the pre-region-layer
+# --- behavior this whole feature replaces). Every page in a multi-page
+# --- document, single- or multi-column, must come out translated. ---
 
-tp.translate = lambda m, t, txt, temp=0.0, report=None: "TRANSLATED: " + txt
+translate_calls = []
+tp.translate = lambda m, t, txt, temp=0.0, report=None: (
+    translate_calls.append(txt) or ("TRANSLATED: " + txt)
+)
 
 with tempfile.TemporaryDirectory() as d:
     d = Path(d)
@@ -212,17 +217,27 @@ with tempfile.TemporaryDirectory() as d:
 
     tp.process_pdf(str(fx), str(out), "stub")
     o = fitz.open(str(out))
-    check("multi-column: document still saved with all 3 pages "
-          "(one flagged page must not abort the whole document)",
+    check("multi-column: document still saved with all 3 pages",
           len(o) == 3, len(o))
-    page1_text, page2_text, page3_text = (o[i].get_text() for i in range(3))
+    page1_text, page2_text, page3_text = (
+        " ".join(o[i].get_text().split()) for i in range(3)
+    )
     o.close()
     check("multi-column: page 1 (fine, single-column) was translated",
           "TRANSLATED:" in page1_text, page1_text)
-    check("multi-column: page 2 (flagged multi-column) was left untranslated, not force-scrambled",
-          "TRANSLATED:" not in page2_text and "Linke Spalte" in page2_text, page2_text)
+    check("multi-column: page 2 (genuinely two-column) is now translated too "
+          "-- real column support, not the old skip-untranslated fallback",
+          "TRANSLATED:" in page2_text and "Linke Spalte" in page2_text
+          and "Rechte Spalte" in page2_text, page2_text)
+    check("multi-column: the two columns were NOT zipped together row by "
+          "row -- each column's lines were sent to translate() as their "
+          "own coherent block, not interleaved with the other column's",
+          any("Linke Spalte" in c and "Rechte Spalte" not in c for c in translate_calls)
+          and any("Rechte Spalte" in c and "Linke Spalte" not in c for c in translate_calls),
+          translate_calls,
+    )
     check("multi-column: page 3 (fine, single-column) was translated too "
-          "(not just the pages before the flagged one)",
+          "(not just the pages before/around the multi-column one)",
           "TRANSLATED:" in page3_text, page3_text)
 
 
@@ -399,6 +414,59 @@ tp.fit_and_insert(page2, fitz.Rect(10, 10, 380, 100),
                    "Ein kurzer deutscher Satz.", 10.0, False, 0.0, None, reports2.append)
 check("Finding 11: a normal, correctly-sized render reports nothing",
       reports2 == [], reports2)
+
+
+# --- LAYOUT_SUPPORT.md Phase 5: tables are translated cell by cell, and
+# --- numeric/symbolic cells are left untouched rather than sent to the
+# --- model (a bare year gives it almost no context). ---
+
+CORPUS = Path(__file__).resolve().parent / "corpus"
+
+tp.load_model = lambda m, seed=0: (object(), object())
+tp.translate = lambda m, t, txt, temp=0.0, report=None: "X-" + txt
+
+with tempfile.TemporaryDirectory() as d:
+    out = Path(d) / "table_out.pdf"
+    tp.process_pdf(str(CORPUS / "table_ruled.pdf"), str(out), "stub")
+    # insert_htmlbox can rewrite a real "-" into an invisible soft hyphen
+    # (U+00AD) at its own internal wrap points -- same normalization
+    # split_page_into_paragraphs already does for reflowed body text.
+    text = " ".join(fitz.open(str(out))[0].get_text().replace("\xad", "-").split())
+    check("table: text cells (header + data) were translated",
+          all(f"X-{w}" in text for w in ["Year", "Edition", "Price", "First", "Second", "Third"]),
+          text)
+    check("table: numeric-only cells (years) were left untouched, not sent "
+          "to the model as a near-empty translation request",
+          all(f"X-{y}" not in text and y in text for y in ["1938", "1951", "1969"]),
+          text)
+
+
+# --- LAYOUT_SUPPORT.md Phase 2 acceptance: --reformat-only on a page with
+# --- a figure must leave the figure alone (still present, nothing drawn
+# --- over it) across repeated passes. ---
+
+tp.translate = lambda m, t, txt, temp=0.0, report=None: txt
+
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    prev = CORPUS / "figure_inline.pdf"
+    for n in range(1, 3):
+        out = d / f"figure_r{n}.pdf"
+        tp.process_pdf(str(prev), str(out), None, skip_translation=True)
+        o = fitz.open(str(out))
+        page = o[0]
+        check(f"figure_inline.pdf reformat pass {n}: image still present",
+              len(page.get_images()) == 1, page.get_images())
+        img_rects = [fitz.Rect(r) for info in page.get_images(full=True)
+                     for r in page.get_image_rects(info[0])]
+        text_lines = [l for b in page.get_text("dict")["blocks"] if b["type"] == 0
+                      for l in b["lines"]]
+        overlap = [l["bbox"] for l in text_lines
+                   for r in img_rects if fitz.Rect(l["bbox"]).intersects(r)]
+        check(f"figure_inline.pdf reformat pass {n}: no text drawn over the image",
+              not overlap, overlap)
+        o.close()
+        prev = out
 
 
 def test_all_checks():

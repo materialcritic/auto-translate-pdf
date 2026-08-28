@@ -1300,3 +1300,66 @@ documented rather than implemented (5, bold support -- explicitly offered
 as a legitimate alternative to a meaningfully larger, riskier change).
 Finding 6 (dead `font` field) was fixed by deletion rather than by
 implementing font fidelity, also per the audit's own offered alternative.
+
+---
+
+## Layout support — columns, images, tables (LAYOUT_SUPPORT.md)
+
+Implements the region layer proposed in `LAYOUT_SUPPORT.md`: a new
+`layout.py` module splits each page into ordered flow `regions` (columns,
+a full-width heading band), `obstacles` (images/vector figures text must
+never be drawn over or redacted through), and `tables` (translated cell by
+cell). `translate_pdf.py`'s paragraph-splitting, reflow, and redaction were
+refactored to operate per-region instead of per-page; a single-column,
+figure-free, table-free page still produces exactly one region, so nothing
+changes for that case. See README.md's new "Layout support" section for
+the user-facing description and `CLAUDE.md` for the architecture notes
+aimed at future changes to this code.
+
+Phases 0-3 and 5 of the plan were implemented (test corpus + `debug_layout.py`
+overlay renderer, `layout.py` itself, the region-aware refactor, retiring
+the old skip-or-`--force` multi-column path, and table translation). Phase
+6 (cross-column paragraph continuation) was not attempted — the plan itself
+flags it as "the one genuinely hard problem... it will be imperfect and it
+is the only part of this plan that can make output worse than the current
+behaviour," to ship behind a flag defaulted off only once trusted; nothing
+here needed it, and building it without dedicated verification would be
+exactly the kind of half-tested layout code this whole feature exists to
+avoid shipping.
+
+Two real bugs surfaced during the refactor, neither anticipated by the
+plan's own code (which predates this repo's Round 4/5 fixes -- leading,
+box/tight-height split -- so its snippets had to be adapted, not copied):
+
+1. **A text region's `rect` from `layout.analyze_page()` is a *tight*
+   bounding box around existing content, not the space available to grow
+   into.** Passed straight through as the fit limit, any paragraph growth
+   at all (even a sub-point rounding difference between reformat passes)
+   read as "region overflow," forcing a rescale a single-column page never
+   needed before this refactor and breaking Round 5 Finding 3's
+   reformat-only idempotency fix again. Fixed by deriving a separate
+   `fit_rect`/`growth_ceiling` in `process_pdf` -- the next region's top,
+   or the page's bottom margin if nothing is in the way -- rather than
+   using the analyzed region rect directly for fitting purposes.
+2. **`page.apply_redactions(fill=(1,1,1))` bakes a solid white rectangle
+   into the page as real vector content.** On any later pass over this
+   pipeline's own output (a second `--reformat-only` run, or the watcher
+   re-triggering), `find_obstacles()` picked up that white-out box as a
+   "figure" the same size and position as the very paragraph it covers,
+   and `apply_text_redactions` then skipped redacting that area to avoid
+   "redacting through a figure" -- leaving the old text underneath
+   un-erased while new text was drawn on top of it, compounding every
+   pass (18 lines -> 36 -> 46 -> 78 -> 140... on one test fixture, purely
+   from re-detecting its own prior output as an obstacle). Fixed by
+   excluding solid-white, borderless-or-white-stroked drawings from
+   `find_obstacles()` -- a real figure is essentially never that.
+
+**Verified:** all four pre-existing test files pass; two new ones added
+(`tests/test_regions.py` for `layout.py` directly against a generated
+corpus, extensions to `tests/test_layout.py` for table translation,
+figure/obstacle survival across repeated reformat-only passes, and real
+multi-column translation without row-by-row zipping). Both bugs above were
+caught by running `--reformat-only` for 7+ successive passes on a
+synthetic fixture and confirming the output geometry/line-count stayed
+exactly stable, not just "close enough" -- the same idempotency-testing
+approach Round 5 Finding 3 established.

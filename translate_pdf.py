@@ -37,6 +37,8 @@ import pymupdf as fitz  # noqa: E402 -- `import fitz` is deprecated as of PyMuPD
 # imported), not left here by oversight -- hence the noqa rather than
 # reordering to satisfy the linter.
 
+import layout  # noqa: E402 -- page-structure detection (columns/obstacles/tables)
+
 DEFAULT_MODEL = "mlx-community/translategemma-4b-it-4bit"
 
 # Fallback values used only when a paragraph has no spans to read a real
@@ -389,39 +391,25 @@ def join_paragraph_lines(pieces, dehyphenate=True):
 
 
 def detect_columns(lines, page_width, min_frac=0.25, min_gap_frac=0.15):
-    """Heuristic multi-column detector. Returns the number of detected
-    column clusters (1 for ordinary single-column prose).
+    """Deprecated. Kept only so `--check` diagnostics and any external
+    caller written against the pre-layout.py pipeline keep working;
+    layout.find_column_split is the real implementation now, and unlike
+    this function it returns the column *rectangles*, which is what makes
+    real multi-column reflow/translation possible in process_pdf, rather
+    than this function's original job of deciding whether to skip or warn.
 
-    "No multi-column support" is a documented limitation, but the actual
-    failure mode isn't graceful unsupport -- it's silent corruption:
-    split_page_into_paragraphs sorts lines page-wide by (y, x) and merges
-    by indent/size/gap, so a two-column page zips the columns together row
-    by row into one fluent-sounding, confidently wrong paragraph, and
-    `--check` reports a plausible-looking "1 paragraph" with no hint
-    anything is wrong.
-
-    Clusters line x0 values by gaps larger than `min_gap_frac * page_width`,
-    then flags 2+ clusters if each covers more than `min_frac` of the
-    page's lines. The gap threshold is deliberately large, not "any gap":
-    ordinary indented-paragraph prose already produces two x0 populations
-    (the flush margin and the indented first line), typically 12-24pt
-    apart -- a real column gutter is far wider, on the order of 15%+ of the
-    page width. A smaller/looser threshold would flag ordinary prose as
-    "multi-column" on every document this splitter is designed for.
-    """
+    Returns the number of detected column clusters (1 for ordinary
+    single-column prose), derived from the lines' own combined bounding
+    box exactly the way process_pdf's pre-region-layer code used to call
+    this."""
     if not lines:
         return 1
-    x0s = sorted(round(l["bbox"][0], 1) for l in lines)
-    min_gap = min_gap_frac * page_width
-    clusters = [[x0s[0]]]
-    for x in x0s[1:]:
-        if x - clusters[-1][-1] > min_gap:
-            clusters.append([x])
-        else:
-            clusters[-1].append(x)
-    n = len(x0s)
-    big_clusters = [c for c in clusters if len(c) / n > min_frac]
-    return max(1, len(big_clusters))
+    x0 = min(l["bbox"][0] for l in lines)
+    x1 = max(l["bbox"][2] for l in lines)
+    y0 = min(l["bbox"][1] for l in lines)
+    y1 = max(l["bbox"][3] for l in lines)
+    cols = layout.find_column_split(lines, fitz.Rect(x0, y0, x1, y1))
+    return len(cols) if cols else 1
 
 
 def modal_left_margin(lines):
@@ -432,28 +420,43 @@ def modal_left_margin(lines):
     return max(set(x0s), key=x0s.count)
 
 
-def split_page_into_paragraphs(blocks, left_margin_tolerance=4.0, gap_multiplier=1.7,
-                                dehyphenate=True):
+def split_lines_into_paragraphs(lines, dominant_size_override=None,
+                                 left_margin_tolerance=4.0, gap_multiplier=1.7,
+                                 dehyphenate=True):
     """
-    Group a page's lines into paragraphs using indentation as the primary
-    signal: a line whose x0 is meaningfully greater than the page's modal
-    left margin starts a new paragraph (standard academic-prose convention
-    -- no blank line between paragraphs, just an indented first line).
+    Group lines into paragraphs using indentation as the primary signal: a
+    line whose x0 is meaningfully greater than the *region's* modal left
+    margin starts a new paragraph (standard academic-prose convention -- no
+    blank line between paragraphs, just an indented first line).
 
-    This works on ALL of a page's lines flattened together, not block by
-    block. Some PDF producers group a whole paragraph's lines into one PDF
-    "block" (then per-block indentation detection would be enough), but
-    others emit one block per line -- in that case a block never contains
-    more than one line to compare margins against, so indentation can never
-    be detected and every line would be mistaken for its own paragraph,
-    stripping context from mid-sentence line breaks and producing fragments
-    the translator has no hope of rendering coherently. Flattening first
-    makes the two cases indistinguishable, which is what we want.
+    Takes lines directly rather than a page's raw blocks, so a caller can
+    pass one region's lines instead of a whole page's (see layout.py) --
+    this works on ALL of the given lines flattened together, not block by
+    block, for the same reason either way: some PDF producers group a whole
+    paragraph's lines into one PDF "block" (then per-block indentation
+    detection would be enough), but others emit one block per line -- in
+    that case a block never contains more than one line to compare margins
+    against, so indentation can never be detected and every line would be
+    mistaken for its own paragraph, stripping context from mid-sentence
+    line breaks and producing fragments the translator has no hope of
+    rendering coherently. Flattening first makes the two cases
+    indistinguishable, which is what we want. `modal_left_margin` in
+    particular must be computed per region, not page-wide: on a two-column
+    page the page-wide modal margin is one column's flush margin, which
+    makes every line in the *other* column look like a ~200pt indent and
+    therefore its own paragraph.
 
     Two extra signals guard against merging things that just happen to
     share the body margin: a large jump in font size (heading dropped into
     the middle of body text) or an unusually large vertical gap (more than
     `gap_multiplier` line-heights) each also force a new paragraph.
+
+    `dominant_size_override`, unlike the margin, stays page-wide when a
+    caller has one to give (see split_page_into_paragraphs / layout-aware
+    callers) -- it only feeds footnote-marker detection
+    (span_is_footnote_marker), and a narrow column of footnotes would
+    otherwise decide its own small type *is* the body size and stop
+    recognizing its own markers.
 
     Deliberately doesn't record the source's typeface: every paragraph
     renders in whichever single serif roman+italic pair font_setup()
@@ -462,7 +465,7 @@ def split_page_into_paragraphs(blocks, left_margin_tolerance=4.0, gap_multiplier
     prose is reliably one serif family throughout), but see "Known
     limitations" in README.md.
     """
-    lines = [l for b in blocks for l in b["lines"] if l["spans"]]
+    lines = [l for l in lines if l["spans"]]
     if not lines:
         return []
     # Sort by row, then left-to-right within the row. Several "line" dicts
@@ -474,7 +477,10 @@ def split_page_into_paragraphs(blocks, left_margin_tolerance=4.0, gap_multiplier
 
     x0s = [round(l["bbox"][0], 1) for l in lines]
     margin = modal_left_margin(lines)
-    page_dominant_size = dominant_size(lines)
+    page_dominant_size = (
+        dominant_size_override if dominant_size_override is not None
+        else dominant_size(lines)
+    )
 
     def body_size_of_line(line):
         """Like dominant_size([line]), but ignores footnote-marker-style
@@ -615,6 +621,18 @@ def split_page_into_paragraphs(blocks, left_margin_tolerance=4.0, gap_multiplier
             "single_line": single_line, "indent": indent, "leading": leading_ratio,
         })
     return result
+
+
+def split_page_into_paragraphs(blocks, left_margin_tolerance=4.0, gap_multiplier=1.7,
+                                dehyphenate=True):
+    """Back-compat wrapper: the whole page (all its blocks' lines
+    flattened) as one region. Kept for check_pdf and any external caller
+    that predates the region-aware layout.analyze_page() path -- see
+    split_lines_into_paragraphs for the real implementation."""
+    lines = [l for b in blocks for l in b["lines"] if l["spans"]]
+    return split_lines_into_paragraphs(
+        lines, None, left_margin_tolerance, gap_multiplier, dehyphenate
+    )
 
 
 # A refusal opener alone ("please", "sorry", "I can('t)...") is not enough
@@ -922,22 +940,66 @@ MIN_PARA_GAP = 2.0      # smallest gap we will squeeze a paragraph gap down to
 MIN_FIT_SCALE = 0.72    # smallest font scale before we give up and warn
 
 
-def fit_placements_to_page(placements, page_rect, bottom_margin=18.0, report=None):
-    """Squeeze a page's flowing placements back inside the page box.
+MAX_OBSTACLE_JUMPS = 32  # loop guard for the push-past-obstacle walk
+
+
+def _clear_of_obstacles(y, h, x0, x1, obstacles, limit):
+    """Lowest y >= the requested y at which an [x0,x1] x [y,y+h] box clears
+    every obstacle whose x-range it overlaps.
+
+    An obstacle only blocks a paragraph it actually sits beside. A figure in
+    the left column must not push the right column's text down, so the x
+    overlap test is required, not just the y one.
+    """
+    for _ in range(MAX_OBSTACLE_JUMPS):
+        moved = False
+        for ob in obstacles:
+            r = ob["rect"]
+            if r.x1 <= x0 or r.x0 >= x1:
+                continue
+            if y < r.y1 and (y + h) > r.y0:
+                y = r.y1 + MIN_PARA_GAP
+                moved = True
+        if not moved:
+            return y
+        if y + h > limit:
+            return y  # let the caller's overflow handling deal with it
+    return y
+
+
+def fit_placements_to_region(placements, region_rect, page_rect, obstacles=(),
+                              bottom_margin=18.0, report=None):
+    """Squeeze one region's flowing placements back inside that region.
+
+    Was fit_placements_to_page (see fit_placements_to_page below for the
+    original single-page-as-one-region docstring, still accurate for the
+    common case). The two things this version adds:
+
+    - The vertical limit comes from the *region*, not the page -- capped at
+      the page's own bottom margin either way, since a region can't extend
+      past the physical page regardless of its own rect. This matters most
+      for columns: a column is roughly half the page's usable height per
+      unit of text, so growth that a full-page limit absorbed silently now
+      has to be fitted for real, and the gap-shrink-then-font-scale ladder
+      fires far more often.
+    - Placements route around `obstacles` (images, vector figures) via
+      `_clear_of_obstacles` -- an obstacle in this region's x-range pushes
+      a paragraph that would otherwise overlap it straight down past it,
+      the same way a pinned folio already couldn't be overlapped.
 
     Reflow preserves each paragraph's original gap to the next one exactly,
-    which is right, but it has no notion of a page bottom: if the English
-    runs longer than the German, every paragraph below the growth is pushed
-    down, and once a rect passes the bottom of the media box, insert_htmlbox
-    still reports a clean fit (it is only asked whether the text fits the
-    *rect*) and happily draws off-page. The result is content that is
-    silently invisible in the output PDF -- no error, no warning, and the
-    overflow also lands on top of any pinned folio on its way down.
+    which is right, but it has no notion of a region bottom on its own: if
+    the English runs longer than the German, every paragraph below the
+    growth is pushed down, and once a rect passes the bottom of the region,
+    insert_htmlbox still reports a clean fit (it is only asked whether the
+    text fits the *rect*) and happily draws off-page. The result is content
+    that is silently invisible in the output PDF -- no error, no warning,
+    and the overflow also lands on top of any pinned folio on its way down.
 
     Two stages, cheapest first:
       1. Shrink the inter-paragraph gaps (never below MIN_PARA_GAP).
       2. If that is not enough, scale every flowing paragraph's font down by
-         a uniform factor and re-measure, so the page stays visually
+         a uniform factor and re-measure, so the region stays visually
          consistent rather than having one arbitrary paragraph shrink.
 
     Pinned placements (folios, running heads) are page-anchored and are left
@@ -955,7 +1017,9 @@ def fit_placements_to_page(placements, page_rect, bottom_margin=18.0, report=Non
     pinned = [p for p in placements if p["pinned"]]
 
     natural_top = flowing[0]["rect"].y0
-    limit = page_rect.y1 - bottom_margin
+    # The region's own bottom, but never past the page's bottom margin --
+    # a region can't extend past the physical page regardless of its rect.
+    limit = min(region_rect.y1, page_rect.y1 - bottom_margin)
     # A pinned footer folio/running-head sitting below the body must act as
     # a hard floor -- the original bug here (this function's own docstring
     # named it) was computing `limit` purely from the page box, so the
@@ -983,7 +1047,8 @@ def fit_placements_to_page(placements, page_rect, bottom_margin=18.0, report=Non
 
     def lay_out(scale):
         """Place the paragraphs top-down at `scale`, with gaps shrunk only as
-        far as needed. Returns (rects, sizes, overflow)."""
+        far as needed and routed around any obstacle in their way. Returns
+        (rects, sizes, overflow)."""
         sizes = [p["size"] * scale for p in flowing]
         # Uses box_height (not tight_height -- see measure_height) since
         # these heights size the actual rects a rescaled page is inserted
@@ -1010,6 +1075,8 @@ def fit_placements_to_page(placements, page_rect, bottom_margin=18.0, report=Non
             if i:
                 g = gaps[i - 1]
                 y += MIN_PARA_GAP + max(0.0, g - MIN_PARA_GAP) * keep
+            if obstacles:
+                y = _clear_of_obstacles(y, h, p["rect"].x0, p["rect"].x1, obstacles, limit)
             rects.append(fitz.Rect(p["rect"].x0, y, p["rect"].x1, y + h))
             y += h
         return rects, sizes, y - limit
@@ -1026,14 +1093,21 @@ def fit_placements_to_page(placements, page_rect, bottom_margin=18.0, report=Non
         # clipped-content case from the merely-rescaled one below -- the
         # watcher (or anyone else scripting around this) can key off it
         # without parsing the human-readable sentence.
-        report(f"  OVERFLOW: page content overflows by {overflow:.0f}pt even at "
+        report(f"  OVERFLOW: region content overflows by {overflow:.0f}pt even at "
                f"{scale:.2f}x font scale -- some text may be clipped")
     elif scale < 1.0 and report:
-        report(f"  page content rescaled to {scale:.2f}x to fit the page")
+        report(f"  region content rescaled to {scale:.2f}x to fit")
 
     for p, r, sz in zip(flowing, rects, sizes):
         p["rect"], p["size"] = r, sz
     return overflow > 0
+
+
+def fit_placements_to_page(placements, page_rect, bottom_margin=18.0, report=None):
+    """Back-compat wrapper: the whole page as one region, no obstacles.
+    See fit_placements_to_region for the real implementation."""
+    return fit_placements_to_region(placements, page_rect, page_rect, (),
+                                     bottom_margin, report)
 
 
 MIN_CHARS_PER_PAGE = 50  # below this, warn that the output may be near-empty
@@ -1071,8 +1145,323 @@ def preflight(doc, page_indices, in_path, report):
                f"({chars} chars across {len(indices)} page(s)); output may be near-empty")
 
 
+def build_region_placements(region_rect, paragraphs, page_body_size, is_page_furniture,
+                             model, tokenizer, skip_translation=False, temp=DEFAULT_TEMP,
+                             report=None, pno=0):
+    """The place()/translate per-paragraph loop, scoped to one region
+    (a page, or -- once layout.analyze_page() is wired in -- one column or
+    band within a page).
+
+    Kept as one function, with the reflow chain's state
+    (prev_orig_y1/prev_new_y1/prev_was_small_text/prev_was_short) local to
+    this call, rather than inlined at each region's call site -- carrying
+    that state across a region boundary is exactly how a two-column page
+    would get zipped/misplaced again in a subtler form: column 2's first
+    paragraph would inherit column 1's last y and land off the bottom of
+    the page. Each call to this function starts that chain fresh."""
+    def report_line(line):
+        if report:
+            report(line)
+
+    prev_orig_y1 = None
+    prev_new_y1 = None
+    prev_was_small_text = False
+    prev_was_short = False
+    placements = []
+
+    def place(para, translated, single_line, pinned=False):
+        nonlocal prev_orig_y1, prev_new_y1, prev_was_small_text, prev_was_short
+        x0, x1 = para["bbox"].x0, para["bbox"].x1
+        if single_line:
+            # headings/bylines were extracted with a bbox tight around
+            # the original (German) text; insert_htmlbox's font metrics
+            # differ slightly from insert_textbox's, so give short
+            # single-line fragments a little slack to avoid an
+            # unwanted wrap when the translation is a touch wider.
+            # The slack is added on the RIGHT only: these boxes are
+            # left-aligned (single_line -> text-align:left), so
+            # widening leftwards moved the text itself off the body
+            # margin (a 14pt heading drifted 10.5pt left of the
+            # column it should line up with). Clamped to the REGION's
+            # right edge, not the page's -- once regions are real
+            # columns, a heading in the left column must not widen
+            # across the gutter into the right one.
+            x1 = min(x1 + para["size"] * 1.5, region_rect.x1 - 2)
+        width = x1 - x0
+        size = para["size"]
+        is_small_text = page_body_size > 0 and size < page_body_size * 0.9
+        # A title/subtitle fragment can wrap to 2 lines, so single_line
+        # alone under-matches -- real body prose runs much longer than
+        # any heading fragment or citation-metadata line, so a short
+        # paragraph length is a better proxy for "this is part of a
+        # title block or short list, not body prose".
+        is_short = len(translated) < 120
+        is_tight_run = (prev_was_small_text and is_small_text) or (
+            prev_was_short and is_short
+        )
+        indent = para.get("indent", 0.0)
+        leading = para.get("leading")
+        if pinned:
+            # Keep its original y and skip the prev_orig_y1/prev_new_y1
+            # chain entirely, so it neither inherits the body's
+            # accumulated shift nor passes a bogus gap on to whatever
+            # follows (deliberately returns before prev_was_small_text/
+            # prev_was_short are updated -- a folio between two
+            # footnote entries shouldn't break tight-run detection for
+            # the entry after it).
+            new_y0 = para["bbox"].y0
+            box_h, _tight_h = measure_height(width, translated, size, single_line, indent, leading)
+            placements.append({
+                "rect": fitz.Rect(x0, new_y0, x1, new_y0 + box_h),
+                "text": translated, "size": size, "indent": indent, "leading": leading,
+                "single_line": single_line, "pinned": True,
+            })
+            return
+        if prev_new_y1 is None:
+            new_y0 = para["bbox"].y0  # first paragraph in the region: keep as-is
+        elif skip_translation and is_tight_run:
+            # Reformat-only mode re-reads a PDF this script already
+            # produced, so "the original gap" here just means whatever
+            # gap is already baked into the (possibly buggy) input --
+            # for a run of footnote/reference entries (same small size
+            # back to back) or title/subtitle fragments (each a single
+            # line, back to back), that's exactly the oversized,
+            # compounding gap this mode exists to fix, so it's
+            # discarded in favor of a small constant instead of
+            # preserved.
+            new_y0 = prev_new_y1 + 3.0
+        else:
+            new_y0 = prev_new_y1 + (para["bbox"].y0 - prev_orig_y1)
+        box_h, tight_h = measure_height(width, translated, size, single_line, indent, leading)
+        insert_bbox = fitz.Rect(x0, new_y0, x1, new_y0 + box_h)
+        prev_orig_y1 = para["bbox"].y1
+        # Anchored to new_y0 + tight_h (the glyph-only extent), not
+        # insert_bbox.y1 (the CSS line-box height, a few points
+        # taller -- see measure_height). Round 5 Finding 3: using
+        # the padded box height here planted a gap that a *later*
+        # reformat-only pass's re-extraction would read back as
+        # part of "the original gap" to the next paragraph and
+        # preserve verbatim, plus add a fresh instance of the same
+        # gap on top -- compounding every pass, forever (2
+        # paragraphs drifted +3pt/pass, 8 paragraphs +21pt/pass).
+        # Anchoring on the same tight geometry a real re-extraction
+        # will actually see leaves nothing left to compound.
+        # insert_bbox itself still uses the full box_h, so nothing
+        # clips; the few points of line-box padding below the last
+        # line just becomes harmless blank space before the next
+        # paragraph's rect starts, well short of overlapping it.
+        prev_new_y1 = new_y0 + tight_h
+        prev_was_small_text = is_small_text
+        prev_was_short = is_short
+        placements.append({
+            "rect": insert_bbox, "text": translated, "size": size, "indent": indent,
+            "leading": leading, "single_line": single_line, "pinned": False,
+        })
+
+    for para in paragraphs:
+        text = para["text"].strip()
+        pinned = is_page_furniture(para, text)
+
+        # Also catches "- 17 -", "[17]", en-dash forms -- not just a bare
+        # integer. `place()` must still be called or the page number is
+        # simply erased with nothing drawn back in its place. Pinning
+        # itself is decided by is_page_furniture() above, independent of
+        # this regex -- this branch's only remaining job is "don't send a
+        # bare number to the translator."
+        if re.fullmatch(r"[\[\(]?\s*[-–—]?\s*\d{1,4}\s*[-–—]?\s*[\]\)]?", text):
+            place(para, text, para["single_line"], pinned=pinned)
+            continue
+
+        if skip_translation:
+            place(para, text, para["single_line"], pinned=pinned)
+            continue
+
+        # A paragraph with almost no real text to translate (e.g. just
+        # a footnote marker, a stray dash) isn't a meaningful translation
+        # request -- sending it to the model risks getting back a
+        # confused conversational reply ("please provide the text...")
+        # instead of a translation, which would then get inserted into
+        # the PDF as if it were real content. Safer to leave it as-is.
+        core = FOOTNOTE_MARKER_RE.sub("", text).replace("*", "").strip()
+        if len(core) < 4:
+            report_line(f"  page {pno + 1}: skipped near-empty paragraph "
+                        f"[{len(text)} chars] -> skipped (too little content)")
+            place(para, text, para["single_line"], pinned=pinned)
+            continue
+
+        translated = translate(model, tokenizer, text, temp=temp, report=report)
+        reason = bad_translation_reason(text, translated)
+        if reason and temp != 0.0:
+            # Only worth a retry when the first attempt wasn't
+            # already deterministic (temp=0.0) -- retrying at the
+            # same temp/seed would just reproduce the same output.
+            report_line(f"  page {pno + 1}: {reason}; retrying once at temp=0")
+            retried = translate(model, tokenizer, text, temp=0.0, report=report)
+            if not bad_translation_reason(text, retried):
+                translated = retried
+                reason = None
+        if reason:
+            report_line(f"  page {pno + 1}: WARNING: {reason} "
+                        f"(paragraph: {text[:60]!r})")
+        translated = preserve_footnote_markers(text, translated)
+        report_line(f"  page {pno + 1}: paragraph translated "
+                    f"[{len(text)} chars] -> [{len(translated)} chars]")
+        place(para, translated, para["single_line"], pinned=pinned)
+
+    return placements
+
+
+_NON_TEXT_CELL_RE = re.compile(
+    r"^[\s\d\.,;:%°/\-+×x()\[\]§–—]*$"
+)
+CELL_INSET = 1.0        # pt; keeps the redaction off the drawn border
+CELL_MIN_SCALE = 0.60   # cells cannot grow, so they shrink further than prose
+
+
+def cell_font(page, rect):
+    """(size, single_line) read from the spans actually inside `rect`."""
+    d = page.get_text("dict", clip=rect)
+    lines = [l for b in d["blocks"] if b["type"] == 0
+             for l in b["lines"] if l["spans"]]
+    if not lines:
+        return FALLBACK_FONT_SIZE, True
+    return dominant_size(lines), len(lines) == 1
+
+
+def fit_cell_size(rect, text, size):
+    """Largest size <= `size` at which `text` fits `rect`, down to
+    CELL_MIN_SCALE.
+
+    A cell has a fixed height -- unlike prose, it cannot push the row below
+    it down without breaking the drawn grid -- so overflow has to be
+    absorbed by type size alone. English is usually only mildly longer
+    than German, but a two-word German compound rendered as a five-word
+    English phrase in a narrow column is exactly the case that needs this.
+    """
+    inner_w = rect.width - 2 * CELL_INSET
+    inner_h = rect.height - 2 * CELL_INSET
+    s = size
+    while s > size * CELL_MIN_SCALE:
+        box_h, _tight_h = measure_height(inner_w, text, s, True, 0.0)
+        if box_h <= inner_h:
+            return s
+        s -= 0.25
+    return size * CELL_MIN_SCALE
+
+
+def process_table_region(page, table, model, tokenizer, temp=DEFAULT_TEMP,
+                          report=None):
+    """Translate a table cell by cell.
+
+    Cell by cell rather than paragraph by paragraph because the grid is the
+    content: a table's rows read left to right, but the paragraph splitter
+    reads a page top to bottom and would concatenate "Jahr | Auflage |
+    Preis" with the first data row into one sentence-shaped string. It also
+    means each cell's rect is known exactly, so the translation goes back
+    where it came from with no reflow at all.
+
+    A short cell is the degenerate translation request bad_translation_reason
+    exists to catch -- a two-word cell gives the model almost no context and
+    invites a conversational reply -- so numeric/symbolic cells are never
+    sent, and any cell whose response fails the plausibility check keeps its
+    source text rather than the model's output.
+    """
+    placements = []
+    redactions = []
+    data = table.extract()
+
+    for row_idx, row in enumerate(table.rows):
+        for col_idx, cell_bbox in enumerate(row.cells):
+            if cell_bbox is None:
+                continue
+            try:
+                source = (data[row_idx][col_idx] or "").strip()
+            except IndexError:
+                continue
+            if not source:
+                continue
+
+            rect = fitz.Rect(cell_bbox)
+            inner = fitz.Rect(rect.x0 + CELL_INSET, rect.y0 + CELL_INSET,
+                               rect.x1 - CELL_INSET, rect.y1 - CELL_INSET)
+            if inner.is_empty:
+                continue
+
+            source = re.sub(r"\s+", " ", source)
+            if _NON_TEXT_CELL_RE.match(source) or len(source) < 2:
+                continue  # a number, a unit, a dash: leave it untouched
+
+            translated = translate(model, tokenizer, source, temp=temp,
+                                    report=report)
+            reason = bad_translation_reason(source, translated)
+            if reason:
+                if report:
+                    report(f"    cell r{row_idx}c{col_idx}: {reason} "
+                           f"-- keeping source text")
+                continue
+
+            size, single_line = cell_font(page, rect)
+            size = fit_cell_size(inner, translated, size)
+            placements.append({
+                "rect": inner, "text": translated, "size": size,
+                "indent": 0.0, "leading": None, "single_line": True, "pinned": True,
+            })
+            redactions.append(inner)
+
+    if report:
+        report(f"  table: {len(placements)} cell(s) translated")
+    return placements, redactions
+
+
+def apply_text_redactions(page, paragraph_rects, placements, obstacles=()):
+    """Erase the source text, one rect per paragraph rather than one union
+    rect for the page.
+
+    A single union rect was fine for single-column prose but is wrong as
+    soon as anything sits inside the text column's bounding box: the union
+    spans around a mid-column figure, and add_redact_annot's fill=(1,1,1)
+    paints white over that whole rect -- images=PDF_REDACT_IMAGE_NONE stops
+    the image being *removed* by the redaction, but does not stop a white
+    rectangle being drawn on top of it. Per-paragraph rects never cover a
+    figure in the first place, and on a multi-column page they also stop
+    one column's redaction from wiping the other's text before it has been
+    re-inserted.
+    """
+    rects = [fitz.Rect(r) for r in paragraph_rects]
+    rects += [fitz.Rect(p["rect"]) for p in placements]
+
+    for r in rects:
+        r = fitz.Rect(r)
+        r.x0 -= 1
+        r.y0 -= 1
+        r.x1 += 1
+        r.y1 += 1
+        r &= page.rect
+        if r.is_empty:
+            continue
+        if any(ob["rect"].intersects(r) for ob in obstacles):
+            # Never redact through a figure. Clipping the rect to avoid it
+            # is possible but rarely needed: reflow has already routed text
+            # around obstacles, so an intersection here means a stray span
+            # (an axis label extracted as text), which is better left alone
+            # than half-erased.
+            continue
+        page.add_redact_annot(r, fill=(1, 1, 1))
+
+    if rects:
+        # Only the text is being replaced. The default
+        # (PDF_REDACT_IMAGE_PIXELS) blanks any image intersecting the
+        # rect -- every figure/plate/scan on the page would otherwise be
+        # erased even where its rect wasn't skipped above.
+        page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_NONE,
+            graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+        )
+
+
 def process_pdf(in_path, out_path, model_name, page_range=None, progress_callback=None,
-                 skip_translation=False, force=False, temp=DEFAULT_TEMP, seed=DEFAULT_SEED):
+                 skip_translation=False, force=False, temp=DEFAULT_TEMP, seed=DEFAULT_SEED,
+                 use_tables=True, table_strategy="lines"):
     """progress_callback(str), if given, is called with a short status line
     at the start of each page and after each paragraph is translated -- the
     watcher script uses this to write live progress to a log file, since
@@ -1084,12 +1473,14 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
     wasteful or would introduce fresh non-determinism into text that's
     already correct.
 
-    force=True translates a page detected as multi-column (see
-    detect_columns) instead of skipping it -- the pipeline has no
-    multi-column support, so by default such a page is left untranslated
-    (with a warning) rather than silently producing a scrambled
-    interleaved-column translation; every other page in the document is
-    still processed normally either way."""
+    force is now a deprecated no-op, kept only so an existing Folder Action
+    invocation or script passing it doesn't break: the page is region-aware
+    now (see layout.analyze_page), so a multi-column page is translated
+    correctly rather than needing to be either skipped or forced through
+    scrambled.
+
+    use_tables/table_strategy are passed straight to layout.find_tables;
+    see --no-tables/--table-strategy's CLI help."""
     def report(line):
         # Always visible on stderr -- this is the only place a real overflow
         # warning (fit_placements_to_page) or a skipped-near-empty-paragraph
@@ -1121,80 +1512,33 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
 
         for i, pno in enumerate(page_indices, start=1):
             page = doc[pno]
-            report(f"--- page {pno + 1} ({i}/{total_pages}) ---")
-            d = page.get_text("dict")
-            blocks = [b for b in d["blocks"] if b["type"] == 0]
 
-            all_lines = [l for b in blocks for l in b["lines"] if l["spans"]]
-            n_cols = detect_columns(all_lines, page.rect.width)
-            if n_cols > 1:
-                msg = (f"page {pno + 1}: looks like a {n_cols}-column layout -- "
-                       "split_page_into_paragraphs reads lines in one page-wide "
-                       "top-to-bottom stream, so columns will be zipped together "
-                       "row by row into scrambled, fluent-sounding nonsense")
-                if not force:
-                    # Skip just this page rather than raising: a book with
-                    # one two-column index/TOC page and 200 fine single-
-                    # column pages is common, and raising here used to
-                    # abort the *entire* process_pdf call -- doc.save()
-                    # only runs after the page loop completes normally, so
-                    # every other page's already-finished work was silently
-                    # discarded too, over one flagged page. --force is still
-                    # the escape hatch for "translate this page anyway."
-                    report(f"  WARNING: {msg} -- SKIPPING this page "
-                           "untranslated (pass --force to translate it anyway)")
-                    continue
-                report(f"  WARNING: {msg}")
+            plan = layout.analyze_page(page, use_tables=use_tables,
+                                        table_strategy=table_strategy)
+            obstacles = plan["obstacles"]
+            report(f"--- page {pno + 1} ({i}/{total_pages}) --- "
+                   f"{len(plan['regions'])} region(s), "
+                   f"{plan['columns']} column(s), "
+                   f"{len(obstacles)} obstacle(s), "
+                   f"{len(plan['tables'])} table(s)")
 
-            # paragraphs are detected across the whole page's lines at once (see
-            # split_page_into_paragraphs) -- reflow is likewise page-wide, so a
-            # paragraph that grows or shrinks pushes everything below it up or
-            # down on the same page, not just its own original sibling lines
-            paragraphs = []
-            page_redact_bbox = None
-            for para in split_page_into_paragraphs(blocks, dehyphenate=not skip_translation):
-                if not para["text"].strip():
-                    continue
-                paragraphs.append(para)
-                page_redact_bbox = (
-                    fitz.Rect(para["bbox"]) if page_redact_bbox is None
-                    else page_redact_bbox | para["bbox"]
-                )
-
-            # Tracks the *actual* (post-translation) bottom of the previous
-            # paragraph, paired with that same paragraph's *original* bottom.
-            # The gap before the next paragraph is then original_gap = next.y0
-            # - prev_orig_y1, applied as new_y0 = prev_new_y1 + original_gap.
-            # This preserves each paragraph's original spacing to the one after
-            # it exactly, regardless of how much this paragraph itself grew or
-            # shrank. The previous approach (accumulating every paragraph's own
-            # height delta into a single running offset applied to each
-            # paragraph's original y0) let a paragraph's shrinkage inflate the
-            # gap *after* it -- harmless for a couple of paragraphs, but in a
-            # references/footnotes list where every entry translates shorter
-            # than the German, those inflated gaps compound down the page into
-            # obviously-oversized blank space between every single entry.
-            # Body text and footnote/reference-list text are reliably set at
-            # different font sizes in the source document (e.g. 11.25pt body vs
-            # 9pt footnotes) -- unlike a leading "[N]" marker, which often ends
-            # up trailing the *previous* entry instead of leading its own (an
-            # extraction quirk from how the source PDF positions footnote
-            # numbers), a paragraph's font size survives untouched, so it's a
-            # more reliable signal for "this is part of a tight reference list".
-            # The largest size on the page, not the most common one -- a page
-            # with more (short) footnote paragraphs than (long) body paragraphs
-            # would otherwise make the footnote size "win" as the apparent body
-            # size by paragraph count, even though it covers far less of the
-            # page and is never actually the main text.
-            page_sizes = [p["size"] for p in paragraphs]
-            page_body_size = max(page_sizes) if page_sizes else 0
+            # Font size stays page-wide (not per-region) for footnote-marker
+            # detection specifically (span_is_footnote_marker, via
+            # split_lines_into_paragraphs' dominant_size_override) -- a
+            # narrow column of nothing but footnotes would otherwise decide
+            # its own small type *is* the body size and stop recognizing
+            # its own markers.
+            all_free_lines = [
+                l for r in plan["regions"] if r["kind"] == "text" for l in r["lines"]
+            ]
+            page_dom_size = dominant_size(all_free_lines) if all_free_lines else None
 
             # Page-anchored furniture (folios, running heads) lives in the
             # top/bottom margin band and must NOT ride the reflow chain --
             # a folio is anchored to the *page*, not to the text flow, so
             # letting it inherit the body's accumulated shift moves it
             # (sometimes hundreds of points) away from where it belongs. See
-            # the `pinned` branch in place() below.
+            # the `pinned` branch in build_region_placements()'s place().
             page_h = page.rect.height
             header_band = page_h * 0.12
             footer_band = page_h * 0.88
@@ -1221,169 +1565,101 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
                 in_band = para["bbox"].y1 <= header_band or para["bbox"].y0 >= footer_band
                 return in_band and para["single_line"] and len(text) < 80
 
-            prev_orig_y1 = None
-            prev_new_y1 = None
-            prev_was_small_text = False
-            prev_was_short = False
-            placements = []
+            all_placements = []
+            redact_rects = []
 
-            def place(para, translated, single_line, pinned=False):
-                nonlocal prev_orig_y1, prev_new_y1, prev_was_small_text, prev_was_short
-                x0, x1 = para["bbox"].x0, para["bbox"].x1
-                if single_line:
-                    # headings/bylines were extracted with a bbox tight around
-                    # the original (German) text; insert_htmlbox's font metrics
-                    # differ slightly from insert_textbox's, so give short
-                    # single-line fragments a little slack to avoid an
-                    # unwanted wrap when the translation is a touch wider.
-                    # The slack is added on the RIGHT only: these boxes are
-                    # left-aligned (single_line -> text-align:left), so
-                    # widening leftwards moved the text itself off the body
-                    # margin (a 14pt heading drifted 10.5pt left of the
-                    # column it should line up with).
-                    x1 = min(x1 + para["size"] * 1.5, page.rect.x1 - 2)
-                width = x1 - x0
-                size = para["size"]
-                is_small_text = page_body_size > 0 and size < page_body_size * 0.9
-                # A title/subtitle fragment can wrap to 2 lines, so single_line
-                # alone under-matches -- real body prose runs much longer than
-                # any heading fragment or citation-metadata line, so a short
-                # paragraph length is a better proxy for "this is part of a
-                # title block or short list, not body prose".
-                is_short = len(translated) < 120
-                is_tight_run = (prev_was_small_text and is_small_text) or (
-                    prev_was_short and is_short
+            for region in plan["regions"]:
+                if region["kind"] == "table":
+                    if skip_translation:
+                        continue  # cells were already rendered in place
+                    tp, tr = process_table_region(
+                        page, region["table"], model, tokenizer,
+                        temp=temp, report=report,
+                    )
+                    all_placements.extend(tp)
+                    redact_rects.extend(tr)
+                    continue
+
+                # Paragraphs are detected within this region's own lines
+                # (see split_lines_into_paragraphs) -- reflow is likewise
+                # scoped to the region (see build_region_placements /
+                # fit_placements_to_region), so a paragraph that grows or
+                # shrinks pushes everything below it up or down within its
+                # own column, not the whole page and not the column beside it.
+                paragraphs = [
+                    p for p in split_lines_into_paragraphs(
+                        region["lines"], dominant_size_override=page_dom_size,
+                        dehyphenate=not skip_translation,
+                    )
+                    if p["text"].strip()
+                ]
+                if not paragraphs:
+                    continue
+
+                # Per region, not per page: on a two-column page the body
+                # size must be read from the column being laid out, or a
+                # column of footnotes beside a column of body text gets the
+                # body-text column's size and its whole tight-run detection
+                # inverted. Same reasoning as Round 3/4's page_body_size,
+                # just scoped down from "page" to "region" now that a region
+                # can be narrower than the page.
+                sizes = [p["size"] for p in paragraphs]
+                region_body_size = max(sizes) if sizes else 0
+
+                # build_region_placements only uses this rect's x1 to cap a
+                # single-line paragraph's right-edge slack (so a heading in
+                # one column can't widen across the gutter into the next).
+                # layout.analyze_page()'s own region rect is a *tight* bbox
+                # around whatever content is actually there, recomputed
+                # fresh on every re-extraction -- feeding that back in here
+                # makes each reformat-only pass's output geometry a (very
+                # slightly) different input to the next pass's tight-bbox
+                # recomputation, and that feedback loop was enough on its
+                # own to break Round 5 Finding 3's idempotency fix again,
+                # by a small but non-plateauing amount pass over pass. On a
+                # single-column page (the common case, and the one that
+                # must not regress) there's no gutter to protect against in
+                # the first place, so use the page's own stable rect
+                # instead, exactly matching pre-refactor behavior with no
+                # feedback loop at all. A genuinely multi-column page still
+                # gets real gutter protection from the region rect.
+                slack_rect = region["rect"] if plan["columns"] > 1 else page.rect
+                placements = build_region_placements(
+                    slack_rect, paragraphs, region_body_size, is_page_furniture,
+                    model, tokenizer, skip_translation=skip_translation, temp=temp,
+                    report=report, pno=pno,
                 )
-                indent = para.get("indent", 0.0)
-                leading = para.get("leading")
-                if pinned:
-                    # Keep its original y and skip the prev_orig_y1/prev_new_y1
-                    # chain entirely, so it neither inherits the body's
-                    # accumulated shift nor passes a bogus gap on to whatever
-                    # follows (deliberately returns before prev_was_small_text/
-                    # prev_was_short are updated -- a folio between two
-                    # footnote entries shouldn't break tight-run detection for
-                    # the entry after it).
-                    new_y0 = para["bbox"].y0
-                    box_h, _tight_h = measure_height(width, translated, size, single_line, indent, leading)
-                    placements.append({
-                        "rect": fitz.Rect(x0, new_y0, x1, new_y0 + box_h),
-                        "text": translated, "size": size, "indent": indent, "leading": leading,
-                        "single_line": single_line, "pinned": True,
-                    })
-                    return
-                if prev_new_y1 is None:
-                    new_y0 = para["bbox"].y0  # first paragraph on the page: keep as-is
-                elif skip_translation and is_tight_run:
-                    # Reformat-only mode re-reads a PDF this script already
-                    # produced, so "the original gap" here just means whatever
-                    # gap is already baked into the (possibly buggy) input --
-                    # for a run of footnote/reference entries (same small size
-                    # back to back) or title/subtitle fragments (each a single
-                    # line, back to back), that's exactly the oversized,
-                    # compounding gap this mode exists to fix, so it's
-                    # discarded in favor of a small constant instead of
-                    # preserved.
-                    new_y0 = prev_new_y1 + 3.0
-                else:
-                    new_y0 = prev_new_y1 + (para["bbox"].y0 - prev_orig_y1)
-                box_h, tight_h = measure_height(width, translated, size, single_line, indent, leading)
-                insert_bbox = fitz.Rect(x0, new_y0, x1, new_y0 + box_h)
-                prev_orig_y1 = para["bbox"].y1
-                # Anchored to new_y0 + tight_h (the glyph-only extent), not
-                # insert_bbox.y1 (the CSS line-box height, a few points
-                # taller -- see measure_height). Round 5 Finding 3: using
-                # the padded box height here planted a gap that a *later*
-                # reformat-only pass's re-extraction would read back as
-                # part of "the original gap" to the next paragraph and
-                # preserve verbatim, plus add a fresh instance of the same
-                # gap on top -- compounding every pass, forever (2
-                # paragraphs drifted +3pt/pass, 8 paragraphs +21pt/pass).
-                # Anchoring on the same tight geometry a real re-extraction
-                # will actually see leaves nothing left to compound.
-                # insert_bbox itself still uses the full box_h, so nothing
-                # clips; the few points of line-box padding below the last
-                # line just becomes harmless blank space before the next
-                # paragraph's rect starts, well short of overlapping it.
-                prev_new_y1 = new_y0 + tight_h
-                prev_was_small_text = is_small_text
-                prev_was_short = is_short
-                placements.append({
-                    "rect": insert_bbox, "text": translated, "size": size, "indent": indent,
-                    "leading": leading, "single_line": single_line, "pinned": False,
-                })
-
-            for para in paragraphs:
-                text = para["text"].strip()
-                pinned = is_page_furniture(para, text)
-
-                # Also catches "- 17 -", "[17]", en-dash forms -- not just a bare
-                # integer. This paragraph's bbox is already folded into
-                # page_redact_bbox above, so it WILL be redacted regardless;
-                # `place()` must still be called or the page number is simply
-                # erased with nothing drawn back in its place. Pinning itself
-                # is decided by is_page_furniture() above, independent of
-                # this regex -- this branch's only remaining job is "don't
-                # send a bare number to the translator."
-                if re.fullmatch(r"[\[\(]?\s*[-–—]?\s*\d{1,4}\s*[-–—]?\s*[\]\)]?", text):
-                    place(para, text, para["single_line"], pinned=pinned)
-                    continue
-
-                if skip_translation:
-                    place(para, text, para["single_line"], pinned=pinned)
-                    continue
-
-                # A paragraph with almost no real text to translate (e.g. just
-                # a footnote marker, a stray dash) isn't a meaningful translation
-                # request -- sending it to the model risks getting back a
-                # confused conversational reply ("please provide the text...")
-                # instead of a translation, which would then get inserted into
-                # the PDF as if it were real content. Safer to leave it as-is.
-                core = FOOTNOTE_MARKER_RE.sub("", text).replace("*", "").strip()
-                if len(core) < 4:
-                    report(f"  page {pno + 1}: skipped near-empty paragraph "
-                           f"[{len(text)} chars] -> skipped (too little content)")
-                    place(para, text, para["single_line"], pinned=pinned)
-                    continue
-
-                translated = translate(model, tokenizer, text, temp=temp, report=report)
-                reason = bad_translation_reason(text, translated)
-                if reason and temp != 0.0:
-                    # Only worth a retry when the first attempt wasn't
-                    # already deterministic (temp=0.0) -- retrying at the
-                    # same temp/seed would just reproduce the same output.
-                    report(f"  page {pno + 1}: {reason}; retrying once at temp=0")
-                    retried = translate(model, tokenizer, text, temp=0.0, report=report)
-                    if not bad_translation_reason(text, retried):
-                        translated = retried
-                        reason = None
-                if reason:
-                    report(f"  page {pno + 1}: WARNING: {reason} "
-                           f"(paragraph: {text[:60]!r})")
-                translated = preserve_footnote_markers(text, translated)
-                report(f"  page {pno + 1}: paragraph translated "
-                       f"[{len(text)} chars] -> [{len(translated)} chars]")
-                place(para, translated, para["single_line"], pinned=pinned)
-
-            fit_placements_to_page(placements, page.rect, report=report)
-
-            if page_redact_bbox is not None:
-                # cover the whole original text footprint, plus any net growth,
-                # in one shot so no leftover German can peek through a shift
-                if placements:
-                    last_bottom = max(p["rect"].y1 for p in placements)
-                    page_redact_bbox.y1 = max(page_redact_bbox.y1, last_bottom + 2)
-                page.add_redact_annot(page_redact_bbox, fill=(1, 1, 1))
-                # Only the text is being replaced. The default
-                # (PDF_REDACT_IMAGE_PIXELS) blanks any image intersecting the
-                # rect, and this rect spans the whole text column -- every
-                # figure/plate/scan on the page would otherwise be erased.
-                page.apply_redactions(
-                    images=fitz.PDF_REDACT_IMAGE_NONE,
-                    graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                # layout.analyze_page() gives each text region a *tight*
+                # rect -- the bounding box of the content actually found
+                # there, not the space available for it to grow into. Used
+                # as-is for the fit limit, that turns any growth at all
+                # (even a sub-point rounding difference between reformat
+                # passes) into an "overflow" needing a rescale, which a
+                # single-column page never needed before this refactor and
+                # which also broke reformat-only idempotency (Round 5
+                # Finding 3) by giving each pass a slightly different
+                # rescale to chase. The real ceiling is wherever the next
+                # region/table that overlaps this one's x-range starts, or
+                # the page's own bottom margin if nothing does -- exactly
+                # how the old single-region-per-page behavior already
+                # worked, generalized to "the next thing in the way."
+                growth_ceiling = min(
+                    [other["rect"].y0 for other in plan["regions"]
+                     if other is not region and other["rect"].y0 > region["rect"].y0
+                     and not (other["rect"].x1 <= region["rect"].x0
+                              or other["rect"].x0 >= region["rect"].x1)]
+                    + [page.rect.y1]
                 )
+                fit_rect = fitz.Rect(region["rect"].x0, region["rect"].y0,
+                                      region["rect"].x1, growth_ceiling)
+                fit_placements_to_region(placements, fit_rect, page.rect,
+                                          obstacles, report=report)
+                all_placements.extend(placements)
+                redact_rects.extend(fitz.Rect(p["bbox"]) for p in paragraphs)
 
-            for p in placements:
+            apply_text_redactions(page, redact_rects, all_placements, obstacles)
+
+            for p in all_placements:
                 fit_and_insert(page, p["rect"], p["text"], p["size"], p["single_line"],
                                p.get("indent", 0.0), p.get("leading"), report)
 
@@ -1455,15 +1731,25 @@ def parse_page_range(spec, npages, warn=None):
     return pages
 
 
-def check_pdf(in_path, page_range=None, report=print):
-    """Report per-page extraction/paragraph-detection diagnostics for
-    `in_path` without loading the model or translating anything -- lets you
-    sanity-check how the heuristics in split_page_into_paragraphs are
+def check_pdf(in_path, page_range=None, report=print, use_tables=True,
+              table_strategy="lines"):
+    """Report per-page extraction/layout diagnostics for `in_path` without
+    loading the model or translating anything -- lets you sanity-check how
+    the heuristics in layout.analyze_page/split_lines_into_paragraphs are
     reading an unfamiliar document (garbled paragraph counts, a
     suspiciously large near-empty count, a modal margin that doesn't match
-    the visible body text) before committing to a full, slow, model-backed
-    run. `report` receives each output line (print by default; tests pass
-    something else to capture it).
+    the visible body text, an unexpected column/table/obstacle count)
+    before committing to a full, slow, model-backed run. `report` receives
+    each output line (print by default; tests pass something else to
+    capture it).
+
+    Region-aware since the layout-support work: paragraph/body-size/
+    near-empty stats are summed/computed across all of a page's *text*
+    regions (columns, bands), and region/obstacle/table counts are
+    reported alongside. A single-column, figure-free, table-free page
+    (the common case) reports exactly what the pre-layout-support version
+    of this function did, just phrased in terms of "1 region" instead of
+    implicitly assuming one.
 
     Returns the list of per-page stat dicts, for programmatic use (e.g. the
     golden-file regression test asserts against these instead of scraping
@@ -1475,46 +1761,46 @@ def check_pdf(in_path, page_range=None, report=print):
         all_stats = []
         for pno in page_indices:
             page = doc[pno]
-            d = page.get_text("dict")
-            blocks = [b for b in d["blocks"] if b["type"] == 0]
-            lines = [l for b in blocks for l in b["lines"] if l["spans"]]
-            paragraphs = split_page_into_paragraphs(blocks)
+            plan = layout.analyze_page(page, use_tables=use_tables,
+                                        table_strategy=table_strategy)
+
+            all_paragraphs = []
+            all_lines = []
+            for region in plan["regions"]:
+                if region["kind"] != "text":
+                    continue
+                all_lines.extend(region["lines"])
+                all_paragraphs.extend(split_lines_into_paragraphs(region["lines"]))
 
             near_empty = 0
-            for para in paragraphs:
+            for para in all_paragraphs:
                 # Same "nothing real to translate" test process_pdf uses to
                 # decide whether a paragraph is worth sending to the model.
                 core = FOOTNOTE_MARKER_RE.sub("", para["text"]).replace("*", "").strip()
                 if len(core) < 4:
                     near_empty += 1
 
-            sizes = [p["size"] for p in paragraphs]
-            n_cols = detect_columns(lines, page.rect.width)
+            sizes = [p["size"] for p in all_paragraphs]
             stats = {
                 "page": pno + 1,
-                "paragraphs": len(paragraphs),
+                "paragraphs": len(all_paragraphs),
                 "body_size": max(sizes) if sizes else None,
-                "modal_margin": modal_left_margin(lines) if lines else None,
+                "modal_margin": modal_left_margin(all_lines) if all_lines else None,
                 "near_empty": near_empty,
-                "columns": n_cols,
+                "regions": len(plan["regions"]),
+                "columns": plan["columns"],
+                "obstacles": len(plan["obstacles"]),
+                "tables": len(plan["tables"]),
             }
             all_stats.append(stats)
             report(
                 f"page {stats['page']}: {stats['paragraphs']} paragraph(s), "
                 f"body size {stats['body_size']}, "
                 f"modal left margin {stats['modal_margin']}, "
-                f"{stats['near_empty']} near-empty"
+                f"{stats['near_empty']} near-empty, "
+                f"{stats['regions']} region(s), {stats['columns']} column(s), "
+                f"{stats['obstacles']} obstacle(s), {stats['tables']} table(s)"
             )
-            if n_cols > 1:
-                # Without this, "1 paragraph" reads as a healthy result for
-                # a multi-column page whose columns got zipped together into
-                # one scrambled blob -- exactly the false all-clear
-                # --check's own purpose (sanity-checking an unfamiliar
-                # document before a slow, model-backed run) exists to avoid.
-                report(f"  WARNING: page {stats['page']} looks like a "
-                       f"{n_cols}-column layout -- this page will be left "
-                       "untranslated unless --force is passed (no "
-                       "multi-column support)")
         return all_stats
     finally:
         doc.close()
@@ -1540,9 +1826,9 @@ def main(argv=None):
                           "or writing any output (see 'Sanity-checking a document' "
                           "in the README)")
     ap.add_argument("--force", action="store_true",
-                     help="translate a page detected as multi-column instead of "
-                          "leaving it untranslated (there is no multi-column "
-                          "support; its output will interleave the columns)")
+                     help="deprecated, now a no-op: multi-column pages are "
+                          "translated properly (see 'Layout support' in the "
+                          "README) and no longer need forcing through")
     ap.add_argument("--temp", type=float, default=DEFAULT_TEMP,
                      help=f"sampling temperature (default {DEFAULT_TEMP} = "
                           "deterministic; translation is a one-right-answer task, "
@@ -1550,6 +1836,15 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED,
                      help=f"RNG seed (default {DEFAULT_SEED}); makes even a "
                           "non-zero --temp repeatable run to run")
+    ap.add_argument("--no-tables", action="store_true",
+                     help="skip table detection; table text is then treated as "
+                          "ordinary prose, which will scramble it (see 'Layout "
+                          "support' in the README)")
+    ap.add_argument("--table-strategy", default="lines",
+                     choices=["lines", "lines_strict", "text"],
+                     help="'lines' (default) needs drawn borders; 'text' also "
+                          "finds borderless tables but false-positives on "
+                          "reference lists and other short-paragraph runs")
     args = ap.parse_args(argv)
 
     try:
@@ -1565,7 +1860,8 @@ def main(argv=None):
         ap.error(str(e))
 
     if args.check:
-        check_pdf(args.input, page_range)
+        check_pdf(args.input, page_range, use_tables=not args.no_tables,
+                  table_strategy=args.table_strategy)
         return
 
     if page_range is not None and len(page_range) < npages:
@@ -1591,6 +1887,7 @@ def main(argv=None):
             None if args.reformat_only else args.model,
             page_range, skip_translation=args.reformat_only,
             force=args.force, temp=args.temp, seed=args.seed,
+            use_tables=not args.no_tables, table_strategy=args.table_strategy,
         )
     except UnsupportedInputError as e:
         ap.error(str(e))

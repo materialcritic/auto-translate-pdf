@@ -1,0 +1,2 @@
+Consider using the pymupdf_layout package for a greatly improved page layout analysis.
+page 1: 2 paragraph(s), body size 10.0, modal left margin 50.0, 0 near-empty, 2 region(s), 2 column(s), 0 obstacle(s), 0 table(s)

@@ -75,11 +75,18 @@ from racing each other or double-loading the model.
 
 ## How the translation pipeline works (`translate_pdf.py`)
 
+Each page is first split by `layout.analyze_page()` (see "Layout support"
+above) into regions (flow areas — a column, a full-width heading band),
+obstacles (images/figures text must route around), and tables. The steps
+below happen *within* each text region — a single-column page with no
+figures or tables produces exactly one region, so this reads the same as
+before that layer existed for that (still the common) case.
+
 1. Extract text blocks per page with PyMuPDF, keeping bbox + font info.
-2. Split the page's lines into paragraphs using first-line indentation as
+2. Split each region's lines into paragraphs using first-line indentation as
    the signal (how justified academic body text is laid out — no blank line
-   between paragraphs, just an indent). This runs across *all* of a page's
-   lines flattened together (`split_page_into_paragraphs`), not block by
+   between paragraphs, just an indent). This runs across *all* of a region's
+   lines flattened together (`split_lines_into_paragraphs`), not block by
    block — some PDF producers group a whole paragraph into one PDF "block"
    (block-level detection would suffice there), but others emit one block
    per line, in which case per-block detection can never see a previous
@@ -203,16 +210,66 @@ Two things only matter in this mode:
 ```
 
 Reports, per page, the paragraph count, the detected body font size, the
-modal left margin, and the near-empty-paragraph count — the same signals
-`split_page_into_paragraphs`/`process_pdf` use internally — without loading
-the model, translating anything, or writing any output. Useful for sanity-
-checking how those heuristics are reading an unfamiliar document before
-committing to a full, slow, model-backed run: a paragraph count wildly out
-of proportion to the page's visible content, a near-empty count that's
-suspiciously high, or a modal margin that doesn't match the visible body
-text all point at the same handful of extraction assumptions (see "How the
-translation pipeline works" above) not fitting this particular PDF's layout.
-`output` isn't required in this mode.
+modal left margin, the near-empty-paragraph count, and (see "Layout
+support" below) the region/column/obstacle/table counts — the same signals
+`split_lines_into_paragraphs`/`layout.analyze_page`/`process_pdf` use
+internally — without loading the model, translating anything, or writing
+any output. Useful for sanity-checking how those heuristics are reading an
+unfamiliar document before committing to a full, slow, model-backed run: a
+paragraph count wildly out of proportion to the page's visible content, a
+near-empty count that's suspiciously high, a modal margin that doesn't
+match the visible body text, or a column/table count that doesn't match
+what the page actually looks like all point at the same handful of
+extraction assumptions not fitting this particular PDF's layout. `output`
+isn't required in this mode.
+
+## Layout support (columns, images, tables)
+
+The pipeline is layout-*safe* rather than layout-*aware* in the sense a
+commercial tool is: it correctly handles the large majority of real
+academic-document layouts and, where it doesn't understand something,
+leaves that part alone instead of producing confident, fluent, wrong
+output.
+
+`layout.py` splits each page into `regions` (ordered flow areas — one per
+column, or a full-width heading band spanning several), `obstacles`
+(images and clustered vector figures that text must never be drawn over or
+redacted through), and `tables` (translated cell by cell, never reflowed).
+A single-column page with no figures or tables — most of the documents
+this pipeline was originally built for — still produces exactly one
+region, so nothing changes for that case.
+
+- **Columns**: detected via real vertical gutters (not a generic
+  whitespace-valley cut, which would fire on every wide paragraph gap in
+  ordinary prose), with a full-width heading correctly read as its own
+  region spanning the columns below it. Reflow is scoped to each column
+  independently, so a paragraph that grows pushes down only its own
+  column. Handles the large majority of two/three-column academic layouts;
+  it will fail on layouts with unequal column counts per band that aren't
+  separated by a spanning heading, and on newspaper-style mixed-width
+  columns. `--check` reports the detected column count; there's no
+  `--force` needed anymore (multi-column pages are translated properly).
+- **Images/figures**: raster images and vector charts (bar charts, plots —
+  clustered from potentially hundreds of individual drawn paths into one
+  obstacle) are detected and text is reflowed around them; redaction is
+  now per-paragraph rather than one union rect for the page, so a figure
+  sitting inside the text column's bounding box is never covered by a
+  white redaction rectangle. Caption anchoring is the fiddly residual — a
+  caption is a short paragraph that happens to sit under a figure, and
+  nothing in the PDF itself says so.
+- **Tables**: `--table-strategy lines` (the default) needs drawn borders;
+  `--table-strategy text` also catches borderless tables but false-
+  positives on reference lists and other short-paragraph runs, so it's an
+  explicit opt-in. `--no-tables` disables table detection entirely (table
+  text then flows as ordinary prose, which will scramble it — only useful
+  as a fallback if detection is misfiring on a specific document). Quality
+  is capped by PyMuPDF's own `find_tables()`, not by this pipeline; ruled
+  tables work well.
+- **Debugging a layout issue**: `debug_layout.py IN.pdf overlay.pdf` draws
+  the detected regions (blue), tables (green), obstacles (red), and column
+  gutters (orange) onto a copy of the PDF — tuning gutter/figure-clustering
+  behavior by reading paragraph counts on stderr doesn't work; look at the
+  boxes.
 
 ## Testing
 
@@ -229,7 +286,20 @@ non-determinism from an actual LLM). Run it directly:
 ```
 
 No test framework dependency; it prints PASS/FAIL per check and exits
-non-zero if anything fails.
+non-zero if anything fails. `tests/test_units.py` and `tests/test_layout.py`
+follow the same style, covering the pure functions and layout-correctness
+regressions (overflow/pinning, reformat-only idempotency, multi-column
+translation, table cell translation, figure/obstacle routing) respectively.
+
+`tests/test_regions.py` tests `layout.py` directly against a small
+generated corpus. Build the corpus first (not committed — `*.pdf` is
+gitignored, since it's generated via `font_setup()`'s system font
+resolution, which differs by machine):
+
+```bash
+./venv/bin/python tests/build_corpus.py
+./venv/bin/python tests/test_regions.py
+```
 
 ## Known limitations
 
@@ -262,15 +332,15 @@ non-zero if anything fails.
 - **Translation quality** depends entirely on TranslateGemma 4B. It reads as
   fluent, idiomatic English on academic German prose, but isn't a substitute
   for professional translation of anything high-stakes.
-- **Only handles single-column, prose-heavy layouts well.** No table
-  support, no multi-column reflow support (a two-column page is now
-  *detected* — `--check` and `process_pdf` both warn, and `process_pdf`
-  leaves a detected multi-column page untranslated by default, translating
-  every other page in the document normally; pass `--force` to translate it
-  anyway — but there's no column-aware reflow, so `--force`ing one through
-  still zips the columns together into one scrambled paragraph). Embedded
-  images/figures are left untouched (the page-wide text redaction
-  explicitly excludes them) but aren't captioned or otherwise processed.
+- **Column, image, and table support is layout-safe, not layout-aware**
+  (see "Layout support" above) — it handles the large majority of academic
+  layouts correctly, but a layout it doesn't understand is left alone
+  rather than translated confidently wrong. Figures aren't captioned. A
+  paragraph that starts at the bottom of one column and continues at the
+  top of the next is currently translated as two disconnected fragments,
+  each without the other's context (splitting the translated English back
+  across the column break to preserve that continuity is the one part of
+  this design not built).
 - **Link and form-widget annotations aren't updated after reflow.** A link
   or widget's rect still points at wherever the *original* German text sat;
   once a paragraph grows, shrinks, or shifts, that rect no longer lines up

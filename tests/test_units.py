@@ -210,19 +210,33 @@ lines = [{"bbox": (72.0, 0, 0, 0)}, {"bbox": (72.0, 0, 0, 0)}, {"bbox": (90.0, 0
 check("modal_left_margin: most common x0 wins",
       tp.modal_left_margin(lines) == 72.0)
 
-# --- detect_columns (Finding 8) ---
+# --- detect_columns (Finding 8; reimplemented as a layout.py shim in the
+# --- layout-support work -- see LAYOUT_SUPPORT.md) ---
 
-def fake_line(x0):
-    return {"bbox": (x0, 0, 0, 0)}
+def fake_line(x0, y, width=80.0, height=10.0):
+    # Real (x0, y0, x1, y1) geometry, not just an x0 -- detect_columns is
+    # now a thin wrapper over layout.find_column_split, which (unlike the
+    # original standalone implementation) reads x1 too, to tell a
+    # spanning line from a narrow one, and needs distinct y values so
+    # lines don't all degenerate to a single row.
+    return {"bbox": (x0, y, x0 + width, y + height)}
 
 
-single_col_lines = [fake_line(72.0)] * 20 + [fake_line(90.0)] * 5  # body + indents
+single_col_lines = (
+    [fake_line(90.0, i * 12.0) for i in range(5)]  # indented first lines
+    + [fake_line(72.0, (i + 5) * 12.0) for i in range(20)]  # flush continuations
+)
 check("detect_columns: ordinary indented single-column prose reads as 1 column",
-      tp.detect_columns(single_col_lines, page_width=468.0) == 1)
+      tp.detect_columns(single_col_lines, page_width=468.0) == 1,
+      tp.detect_columns(single_col_lines, page_width=468.0))
 
-two_col_lines = [fake_line(72.0)] * 15 + [fake_line(320.0)] * 15
+two_col_lines = (
+    [fake_line(72.0, i * 12.0, width=200.0) for i in range(15)]
+    + [fake_line(320.0, i * 12.0, width=200.0) for i in range(15)]
+)
 check("detect_columns: two well-separated x0 clusters read as 2 columns",
-      tp.detect_columns(two_col_lines, page_width=600.0) == 2)
+      tp.detect_columns(two_col_lines, page_width=600.0) == 2,
+      tp.detect_columns(two_col_lines, page_width=600.0))
 
 check("detect_columns: empty input is 1 column",
       tp.detect_columns([], page_width=468.0) == 1)
