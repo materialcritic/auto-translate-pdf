@@ -41,18 +41,22 @@ import translate_pdf as tp  # noqa: E402
 from fixtures import build_fixture  # noqa: E402
 
 
-def stub_load_model(model_name):
+def stub_load_model(model_name, seed=0):
     return object(), object()
 
 
 def make_stub_translate(calls):
-    def stub_translate(model, tokenizer, german_text):
+    def stub_translate(model, tokenizer, german_text, temp=0.0, report=None):
         calls.append(german_text)
         # Identity "translation" -- this test cares about structural
         # correctness (paragraph splitting, marker/italic round-tripping,
         # hyphenation, folio pinning), not translation quality, and a real
         # model load would make the test slow, environment-dependent, and
-        # non-deterministic.
+        # non-deterministic. Expect process_pdf's own echo-detection
+        # heuristic (Finding 10, Round 4) to fire and report a "probable
+        # no-op/echo" WARNING on every longer paragraph here -- that's it
+        # correctly noticing the identity stub is, in fact, an echo; not a
+        # bug in the stub or the heuristic.
         return german_text
     return stub_translate
 

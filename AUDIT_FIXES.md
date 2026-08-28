@@ -1,264 +1,11 @@
-# auto-translate-pdf — pipeline overview & audit/fix history
+# auto-translate-pdf -- audit & fix history
 
-This is the detailed technical record of the whole project: what the
-pipeline does and how it works end to end, plus everything three rounds of
-external audit found and how each fix was verified. `README.md` carries a
-shorter version of the pipeline mechanics for a first-time reader; this file
-is the fuller reference.
+For what this project is and how the pipeline works, see [README.md](README.md)
+-- this file used to duplicate that description (and had already started
+drifting from it) and now only carries the audit-round record, which
+README.md doesn't.
 
----
-
-## What this is
-
-A local, offline German → English PDF translator. Drop a PDF in, get back
-`<name>_en.pdf` with the same layout — paragraph structure, headers/footers,
-footnote reference numbers, and italics (book titles, emphasis) all carried
-over, not just a flat text dump.
-
-Everything runs on-device: translation is done by
-[TranslateGemma 4B](https://huggingface.co/google/translategemma-4b-it)
-(Google's Gemma 3 fine-tuned for translation), running locally via
-[`mlx-lm`](https://github.com/ml-explore/mlx-lm) on Apple Silicon. No API
-keys, no cloud calls, no per-page cost. `colab_translate.ipynb` in this repo
-runs the same pipeline on a free Colab GPU instead, via `transformers` + 4-bit
-`bitsandbytes`, for anyone without Apple Silicon handy — same model family,
-same chat-template format, just a different `generate()` call and no Folder
-Action (that part's macOS-only).
-
-## Setup
-
-```bash
-git clone https://github.com/materialcritic/auto-translate-pdf.git
-cd auto-translate-pdf
-python3 -m venv venv
-./venv/bin/pip install -r requirements.txt
-```
-
-The model (`mlx-community/translategemma-4b-it-4bit`, ~2.1 GB) downloads once
-on first run and is cached under `~/.cache/huggingface/hub/` — no re-download
-on subsequent runs.
-
-### Standalone usage
-
-```bash
-./venv/bin/python translate_pdf.py input.pdf output.pdf [--pages 1-5]
-```
-
-### Folder-watch usage (macOS Folder Action)
-
-`scripts/auto_translate_pdf.py` watches a folder (`~/Translate` by default —
-edit `FOLDER` at the top of the script to change it) and translates any PDF
-dropped there, hands-off. It's designed to be triggered by a macOS Folder
-Action:
-
-1. In Automator, create a new "Folder Action" workflow attached to your
-   watched folder, with a single "Run Shell Script" (`/bin/zsh`) action
-   running:
-   ```
-   /path/to/auto-translate-pdf/venv/bin/python3 /path/to/auto-translate-pdf/scripts/auto_translate_pdf.py
-   ```
-2. Save the workflow, then attach it to the folder (Folder Actions run when
-   Finder detects a new item added to the attached folder — this also fires
-   for files added via a script or `cp`, not just drag-and-drop).
-
-It's also safe to just run the script directly, or on a cron — it only
-touches files it hasn't successfully translated before (tracked in a
-`.auto_translate_state.json` file inside the watched folder, keyed on each
-file's path *and* size/mtime — see Finding 10 below — so replacing a file
-under the same name gets picked up rather than skipped forever), and a lock
-file keeps concurrent triggers from racing each other or double-loading the
-model. `wait_until_stable()` also holds off on a file until its size has
-stopped changing for a couple of polls, since a Folder Action fires on "item
-added," which for a large or network-copied file can precede the last byte
-actually landing.
-
-## How the translation pipeline works (`translate_pdf.py`)
-
-1. **Extract** text blocks per page with PyMuPDF, keeping bbox + font info
-   for every span.
-2. **Split into paragraphs.** `split_page_into_paragraphs` groups a page's
-   lines using indentation as the primary signal — how justified academic
-   body text is laid out: no blank line between paragraphs, just an indented
-   first line. This runs across *all* of a page's lines flattened together,
-   not block by block: some PDF producers group a whole paragraph into one
-   PDF "block" (block-level detection would suffice there), but others emit
-   one block per line, in which case per-block detection can never see a
-   previous line to compare indentation against, and every line would be
-   mistaken for its own paragraph — destroying sentence structure at every
-   mid-sentence line break. Flattening first makes the two cases
-   indistinguishable, which is what's wanted.
-
-   Several more signals guard against merging things that just happen to
-   share the body margin, or splitting things that shouldn't be split:
-   - A large font-size jump forces a paragraph break (a heading dropped into
-     body text shouldn't get swallowed into the surrounding paragraph) —
-     computed while ignoring footnote-marker spans specifically, since a
-     line consisting only of a trailing footnote marker would otherwise
-     report that marker's tiny font size as a spurious size jump and get
-     sliced into its own degenerate one-token "paragraph."
-   - Lines at (almost) the same y-coordinate as the previous line are always
-     treated as the same physical line continuing, regardless of x0/size.
-     Some PDFs (justified text with unusually wide word-cluster gaps) get
-     split by PyMuPDF into several "line" dict entries that are really one
-     visual line — without this guard, each word cluster's x0 would look
-     like an indent and shatter the line into one-word "paragraphs"
-     translated in isolation, scrambling the sentence.
-   - A line that *opens* with a footnote reference marker also forces a new
-     paragraph — footnote/reference-list entries sit flush at the body
-     margin, same size, one after another with normal line spacing, so none
-     of the other signals fire between consecutive entries; without this,
-     a whole block of footnotes gets merged and translated as one run-on
-     blob.
-3. **Mark up inline formatting as plain-text tokens.** A translation model
-   only ever sees a flat string, so any real character-level formatting has
-   to survive as literal characters or it's lost:
-   - A footnote reference number (a separate, smaller-font span glued
-     directly onto the preceding word, e.g. "1938" + superscript "1") is
-     rewritten as an explicit `[1]` token — otherwise it gets silently
-     absorbed into the adjacent number (`"19381"`) and becomes
-     unrecoverable. Unicode superscript digits (¹²³...) are normalized to
-     ASCII first, since a raw `[¹]` could never be matched by the regex that
-     looks for it again later.
-   - An italic span is wrapped in `*asterisks*`. TranslateGemma reliably
-     passes this markdown-style emphasis through translation intact
-     (confirmed empirically — it already produces this style on its own for
-     things like book titles). A literal `*` already present in the source
-     (German uses `* 1903` for a birth date; plain arithmetic like `2 * 4`
-     also occurs) would otherwise be indistinguishable from an italic
-     delimiter once spans are flattened to a string, so it's parked on a
-     private-use Unicode sentinel first and restored to a literal `*` only
-     at render time.
-4. **Translate** each paragraph with TranslateGemma via `mlx_lm.generate`.
-   TranslateGemma's chat template requires a specific structured message
-   format (`{"type": "text", "source_lang_code": "de", "target_lang_code":
-   "en", "text": ...}`) — it does not accept a system prompt or free-form
-   instructions, unlike a general chat model.
-5. **Recover anything the model dropped.** If a `[N]` footnote marker didn't
-   survive translation verbatim, it's appended at the end of the paragraph
-   rather than silently lost (imperfect placement, but nothing disappears —
-   and this check is count-aware, so a paragraph carrying `[1]` twice only
-   treats it as complete if *both* survived). Separately, a paragraph with
-   almost no real text after stripping markers (fewer than 4 characters —
-   e.g. a stray dash, or a footnote marker that still ended up alone despite
-   the paragraph-merge guards above) is never sent to the model at all: a
-   translation request with nothing real to translate risks getting back a
-   confused conversational reply ("please provide the German text...")
-   instead of an actual translation, which would otherwise get inserted into
-   the PDF as if it were real content.
-6. **Reflow page-wide**, not block-by-block. Each paragraph's gap to the
-   *next* one is computed from the original document (`next.y0 - this.y1`)
-   and applied unchanged after the actual rendered bottom of this paragraph
-   (`new_y0 = prev_new_y1 + original_gap`) — so a paragraph that translates
-   shorter or longer pushes everything below it up or down, but the spacing
-   it leaves behind matches the original layout's intent exactly, rather
-   than compounding a paragraph's own shrinkage into the gap after it.
-   Page-anchored furniture (folios, running heads — digit-only paragraphs
-   sitting in the top/bottom 12% margin band of the page) is *pinned*
-   instead: kept at its original position and excluded from this chain
-   entirely, since a folio is anchored to the page, not to the text flow,
-   and would otherwise inherit the body's accumulated shift (or, worse, if
-   it's the first paragraph on the page, *become* the chain's anchor and
-   drag the entire body up or down with it).
-7. **Clamp to the page.** `fit_placements_to_page` runs after every
-   paragraph on a page has been placed, and before redaction: if the
-   English runs long enough that the flowing placements would extend past
-   the page bottom, it first shrinks the inter-paragraph gaps (never below a
-   floor), and if that alone isn't enough, scales every flowing paragraph's
-   font down by one uniform factor (so the page stays visually consistent
-   rather than one arbitrary paragraph shrinking) and re-measures. Pinned
-   placements are left untouched throughout, since they're page-anchored,
-   not flow-anchored. If even the minimum scale won't fit, the text is laid
-   out clipped at that scale and a warning is reported rather than the
-   overflow simply vanishing off-page with no error at all.
-8. **Redact and re-insert.** The original page's entire text footprint is
-   redacted in one shot (scoped to text only — `PDF_REDACT_IMAGE_NONE` /
-   `PDF_REDACT_LINE_ART_NONE`, so embedded images/figures on the page
-   survive untouched), then the English text is re-inserted via
-   `page.insert_htmlbox()` (not the simpler `insert_textbox`) so that
-   `*italic*` markers can become real `<i>` runs, using an embedded Times
-   New Roman + Times New Roman Italic (via `fitz.Archive`, built lazily on
-   first use with a fallback list of font locations) — PyMuPDF's built-in
-   base-14 fonts only cover a narrow glyph set and silently render smart
-   quotes/em dashes as `?`.
-9. **Save.** `garbage=4, deflate=True` finds and merges duplicate embedded
-   font objects — without it, each `insert_htmlbox` call embeds its own font
-   subset rather than reusing one already on the page, which across a
-   41-page document produced 1,143 duplicate font objects and ballooned a
-   file that should be ~1MB into ~950MB. Saved to a `.part` temp name and
-   renamed on success, so a mid-run failure never leaves a corrupt or
-   partial file where the watcher's `out.exists()` check would mistake it
-   for a completed translation.
-
-## Reformat-only mode (fix layout without re-translating)
-
-`process_pdf(in_path, out_path, model_name, skip_translation=True)`
-(or `translate_pdf.py ... --reformat-only` from the CLI) re-reads an
-*already-English* PDF this script produced and re-runs only the
-extraction/reflow/rendering steps — no model load, no translation calls. Use
-this for a pure formatting fix on an existing output (e.g. after a
-rendering-bug fix lands, to fix a file translated before the fix without
-paying for a fresh translation, which would also introduce fresh
-non-determinism into text that was already correct):
-
-```python
-import sys; sys.path.insert(0, ".")
-from translate_pdf import process_pdf
-process_pdf("in_en.pdf", "out_en.pdf", None, skip_translation=True)
-```
-
-Two things only matter in this mode:
-- `dehyphenate` is forced off. `insert_htmlbox` never hyphenates at a real
-  line break the way German typesetting does, so a "-" in re-extracted text
-  is always a real character (a compound word, a name, a page range) — the
-  normal de-hyphenation rule would wrongly delete it. Reformat mode instead
-  keeps the hyphen and joins the two halves without inserting a space.
-- Consecutive paragraphs identified as "tight" (either both smaller than the
-  page's largest font size, i.e. a footnote/reference-list run, or both
-  short — under 120 characters, catching title/subtitle fragments and
-  citation-metadata lines) get a fixed 3pt gap instead of the gap preserved
-  from the input file, since in this mode "the original gap" just means
-  whatever's already baked into the file being reformatted — for these runs
-  that can be exactly the oversized/compounding gap a fix is meant to
-  correct, not a genuine layout intent to preserve.
-
-## Known limitations
-
-- **Very short italic phrases** (2-3 words) occasionally lose the `*...*`
-  marker during translation and render as plain text — content is never
-  lost, just the emphasis styling on that one phrase.
-- **A hyphenated word split across a line break can leave a residual
-  fragment** in a paragraph-merge edge case not yet covered (the common
-  case, including hyphenation across an italic-run boundary, is handled) —
-  this is heuristic-based extraction from arbitrary PDF layouts, not a
-  guarantee against every possible producer quirk. Spot-check unfamiliar
-  documents' output, especially around footnotes and section breaks.
-- **Translation quality** depends entirely on TranslateGemma 4B. It reads as
-  fluent, idiomatic English on academic German prose, but isn't a substitute
-  for professional translation of anything high-stakes.
-- **Only handles single-column, prose-heavy layouts well.** No table
-  support, no multi-column layout support. Embedded images/figures are left
-  untouched but aren't captioned or otherwise processed.
-- Assumes German → English. There's no language auto-detection; dropping a
-  non-German PDF will still run it through the DE→EN model.
-- Each run loads a ~2 GB model into memory — a full 14-page document took
-  about 7 minutes end-to-end on a base M1 Air; a 40-page document took ~49
-  minutes on the same machine under memory pressure from other running
-  apps. Dropping several PDFs in quick succession queues them (via a lock
-  file) rather than running translations in parallel, so as not to fight
-  over memory/model reloads.
-
-## License
-
-MIT for the code in this repo. The model it downloads and runs
-(`mlx-community/translategemma-4b-it-4bit`, derived from Google's Gemma 3) is
-distributed separately under its own
-[Gemma license terms](https://ai.google.dev/gemma/terms).
-
----
-
-# Audit & fix history
-
-Three rounds of external audit have been run against this pipeline since the
+Four rounds of external audit have been run against this pipeline since the
 initial publish. What follows is the detailed record of what each one found,
 what was actually fixed, and how each fix was verified.
 
@@ -766,7 +513,414 @@ in `translate_pdf.py`.
    known contents (heading, 2 body paragraphs, 2 footnote entries, 1 folio;
    the folio is the near-empty one).
 
-Nothing else is open: all findings from Rounds 1–3 are fixed and verified,
-the Round 2 leftovers above are fixed and verified, and both Round 1
-"worth adding regardless" items are built. Finding 9's loader concern
-(above) is the one item closed as won't-fix rather than fixed.
+All findings from Rounds 1–3 are fixed and verified, the Round 2 leftovers
+above are fixed and verified, and both Round 1 "worth adding regardless"
+items are built. Finding 9's loader concern (above) is the one item closed
+as won't-fix rather than fixed.
+
+---
+
+## Round 4 — fresh audit against `fabee59` (22 findings)
+
+Commit audited: `fabee59` ("Fix Round 2 leftovers, add golden test + --check
+mode"). This audit cloned the repo on Linux x86, installed `pymupdf` alone,
+ran `tests/test_golden.py` (all 11 checks passed), then wrote targeted repro
+scripts against the real pipeline with `load_model`/`translate` stubbed.
+Findings marked **CONFIRMED** in the audit had an executed repro; findings
+marked **BY INSPECTION** were code readings that needed either a real model
+or macOS to execute (the Folder Action path, the mlx-lm generation path).
+
+Fixed in the audit's own suggested order: **1** (report to stderr, makes
+everything else visible while working on it) → **15 + 16** (split
+requirements, add CI) → **2, 3, 4** (the layout-correctness cluster) →
+**5** + `tests/test_units.py` (**17**) → **7, 8** (input validation, column
+detection) → **6, 9, 10** (the model-call cluster) → **11, 12, 14** (watcher
+robustness) → everything else (13, 18–22).
+
+### 1. P0 — the overflow/clipping warning never reached anyone on the CLI — Fixed + verified
+
+`report()` was a no-op unless a `progress_callback` was passed, and the CLI
+(`translate_pdf.py in.pdf out.pdf`) passes none — so `fit_placements_to_page`'s
+overflow warning and the skipped-near-empty-paragraph notices were computed,
+formatted, and thrown away on every invocation except the Folder Action
+watcher's, defeating Round 3 Finding 1's whole point on the standard CLI path.
+
+**Fix:** `report()` now always prints to stderr in addition to calling the
+callback when one is given; the now-duplicated bare `print(..., file=sys.stderr)`
+calls in the page loop were folded into `report()` calls instead, so each
+event is emitted exactly once. A genuine (not just rescaled) overflow now
+reports with a stable `OVERFLOW:` prefix a script can grep for, and
+`fit_placements_to_page` returns whether content still overflowed, threading
+a real signal out of what used to be a fire-and-forget call.
+
+**Verified:** re-ran the audit's own repro (a fixture expanded 14×, no
+`progress_callback` passed) — the warning now appears on stderr.
+
+### 2. P0 — reflowed body text could collide with the pinned folio — Fixed + verified
+
+`fit_placements_to_page`'s bottom limit was a fixed page-box margin with no
+knowledge of where pinned placements (folios, running heads) actually sit --
+its own docstring already named this exact failure ("the overflow also lands
+on top of any pinned folio on its way down"), but the implementation only
+guarded against running off the media box.
+
+**Fix:** the limit is now clamped to `min(page-box limit, nearest pinned
+item below the body) - MIN_PARA_GAP`; symmetrically, the flowing content's
+top is pushed below any pinned item sitting at/above its natural start (a
+header running head).
+
+**Verified:** a 3-paragraph body on a 400pt-tall page, translated text
+expanded 12× (`tests/test_layout.py`), correctly rescales to 0.84× and
+produces zero overlap between any flowing line's rect and the pinned folio's
+rect; the fit outcome is reported via Finding 1's stderr path.
+
+### 3. P0 — only bare-digit paragraphs were page-anchored; textual running heads/footers rode the reflow — Fixed + verified
+
+`pinned=True` was reachable from exactly one place: the branch matching a
+paragraph against the bare-page-number regex. A textual running head or
+footer ("Kapitel 3 - Einleitung", the norm in academic German typesetting)
+was ordinary body prose to the pipeline and inherited the body's accumulated
+shift -- the exact Round 2 regression, for a class of furniture that fix
+never covered.
+
+**Fix:** `is_page_furniture(para, text)` decides pinning on geometry (in the
+header/footer 12% band, single line, under 80 characters) for *every*
+paragraph, not just digit-only ones; the bare-number regex branch now only
+decides "don't send this to the translator," nothing about layout.
+
+**Verified:** a page with a textual header ("Kapitel 3 - Einleitung")
+authored at y=40 and a body paragraph below it, translated text unchanged in
+length -- the header stays within 10pt of y=40 in the output instead of
+drifting with the body.
+
+### 4. P1 — first-line indent was dropped, so indent-separated paragraphs merged visually — Fixed + verified
+
+`split_page_into_paragraphs` uses first-line indentation as its primary
+paragraph-detection signal, but the indent was only ever consumed, never
+reproduced -- `paragraph_html` emitted no `text-indent`, and `place()` used
+the paragraph's bbox union (the flush margin), not the indented first line.
+For the layout convention this splitter is built around (no blank line
+between paragraphs, indent only), this removed the source's *only*
+paragraph separator from the output: two indent-separated paragraphs read
+as one continuous block in the translated PDF.
+
+**Fix:** `split_page_into_paragraphs` records `indent = para_lines[0].x0 -
+bbox.x0` per paragraph (0 for single-line paragraphs, which are headings/
+bylines, not indented body prose); threaded through `paragraph_html`,
+`measure_height`, `fit_and_insert`, and every `placements` dict.
+
+**Verified:** two indent-separated 2-line German paragraphs (first line at
+x0=90, continuation at x0=72) -- after translation (identity stub), both
+paragraphs' first lines render at x0=90.0 in the output, distinguishable
+from their own continuation lines at x0=72.0.
+
+### 5. P1 — `join_paragraph_lines` lost italics across a hyphenated line break in the proper-noun/page-range branch — Fixed + verified
+
+Three of the join's four branches merge the two runs when a hyphen break
+falls inside an italic run; the final `else` branch (proper nouns, page
+ranges: "Schulte-" + "Sasse") didn't, producing `*Schulte-**Sasse*`, which
+`text_to_html`'s `**`->`*` bold-normalization then closed one character
+early, silently dropping italics from the first half: `Schulte-<i>Sasse</i>`.
+
+**Fix:** added the same `if tail and opens_italic: merge` guard the sibling
+branches already had.
+
+**Verified**, both directly (`join_paragraph_lines(['*Schulte-*', '*Sasse*'],
+True)` → `'*Schulte-Sasse*'`, and the same for `'*Titel-*'`/`'*Fortsetzung*'`)
+and via `tests/test_units.py`'s full branch × italic × dehyphenate matrix,
+which would have caught this directly without any PDF rendering at all.
+
+### 6. P1 — `max_tokens=1024` could silently truncate long paragraphs — Fixed (by inspection; no GPU here to run the real model)
+
+A single fixed cap for every paragraph, with nothing checking whether
+generation stopped at `<end_of_turn>` or ran out of budget -- a dense
+academic paragraph or footnote block (2500-3500 chars is normal) can exceed
+1024 output tokens, and the cut-off translation would be inserted as if
+complete; `preserve_footnote_markers` would then append the truncated
+tail's markers, making it look *more* plausible.
+
+**Fix:** `max_tokens` is now sized off the source (`max(256, min(4096,
+int(n_src * 2.5) + 64))`, `n_src` from `tokenizer.encode`), and a heuristic
+truncation check reports a warning when the source ended in sentence-final
+punctuation, the output didn't, and the output is already using most of the
+implied character budget. Not a hard guarantee (mlx_lm.generate's plain-
+string return exposes no finish reason to check directly), but strictly
+better than the old fixed cap with no check at all.
+
+### 7. P1 — no input validation before the ~2GB model load — Fixed + verified
+
+An encrypted PDF surfaced as a cryptic `ValueError: document closed or
+encrypted` on the first `page.get_text()` -- *after* the full model load. An
+image-only scan silently extracted zero paragraphs, redacted nothing, and
+saved the untouched German original under an `_en` name with `status=ok` in
+the watcher's log.
+
+**Fix:** `preflight(doc, page_indices, in_path, report)` runs before
+`load_model`, raising a new `UnsupportedInputError` (a `ValueError`
+subclass) for a password-protected PDF, zero pages, or zero extractable
+characters, and reporting a warning for suspiciously little text. The
+watcher catches `UnsupportedInputError` specifically and routes it straight
+to `failed` instead of burning `MAX_ATTEMPTS` retries that would fail
+identically every time.
+
+**Verified:** a password-protected PDF and a text-free (image-only) PDF each
+raise the expected `UnsupportedInputError` with an actionable message
+(`... run OCR (e.g. ocrmypdf) first`) before any model-loading code runs.
+
+### 8. P1 — multi-column pages silently interleaved into one scrambled paragraph — Fixed + verified (detection; full column support out of scope)
+
+Lines are sorted page-wide by `(y, x)`; on a two-column page this zips the
+columns together row by row into one fluent-sounding, confidently wrong
+paragraph, and `--check`'s own "1 paragraph" reads as healthy -- a false
+all-clear from the exact diagnostic meant to catch this.
+
+**Fix (detection):** `detect_columns(lines, page_width)` clusters line x0
+values by gaps larger than 15% of the page width (deliberately large --
+ordinary indented-paragraph prose already produces two x0 populations 12-24pt
+apart, and a small threshold would flag every such document as
+"multi-column"), then flags 2+ clusters if each covers more than 25% of the
+page's lines. `check_pdf` reports a warning; `process_pdf` refuses with
+`UnsupportedInputError` unless `force=True` / `--force` is passed. Full
+column-aware reflow (partition into bands, run the splitter per band) is the
+larger fix the audit itself called "the single largest capability gap" and
+is not attempted here.
+
+**Verified:** a synthetic two-column page (`tests/test_units.py`) is
+detected as 2 columns; an ordinary indented single-column fixture stays at
+1; `process_pdf` raises without `--force` and proceeds (with a warning)
+with it.
+
+### 9. P1 — translation was non-deterministic by default and unseeded — Fixed (by inspection; no GPU here to run the real model)
+
+`temp=0.3` bought nothing for a one-right-answer task and cost run-to-run
+reproducibility -- directly undercutting reformat-only mode's own stated
+rationale ("re-translating would introduce fresh non-determinism"). No RNG
+seed was set either.
+
+**Fix:** `DEFAULT_TEMP = 0.0`, exposed as `--temp` on the CLI;
+`load_model()` seeds `mx.random` explicitly (`DEFAULT_SEED = 0`, `--seed`),
+so even a non-zero `--temp` stays repeatable run to run.
+
+### 10. P2 — no sanity check on what the model returns — Fixed + verified
+
+The near-empty guard prevents *sending* a degenerate request but nothing
+inspected the *response* -- an echoed source, a conversational refusal
+("Please provide the German text..."), or a wildly truncated/runaway output
+would be inserted into the PDF verbatim.
+
+**Fix:** `bad_translation_reason(text, translated)` flags an identical
+echo (paragraphs over 40 chars), an output under 35% or over 300% of the
+source length, or a conversational-refusal shape via regex. `process_pdf`
+reports the reason and, when `temp != 0.0` (a deterministic retry at the
+same settings would just reproduce the same output), retries once at
+`temp=0`.
+
+**Verified** via `tests/test_units.py`'s direct cases for all four shapes,
+plus the golden test's identity stub correctly triggering the echo case
+(expected, documented in the stub's own comment -- not a bug).
+
+### 11. P2 — the watcher crashed if a pending file disappeared mid-run — Fixed + verified
+
+`file_key(p)`'s unguarded `p.stat()` raised `FileNotFoundError` for a file
+moved or deleted between the initial `rglob()` and the pending-list
+comprehension -- a normal thing to happen in a watched drop folder -- taking
+down the whole run, including every file queued behind it. `file_key` was
+also computed twice per file for no reason.
+
+**Fix:** `file_key` catches `OSError` and returns `None`; the pending-list
+construction skips a `None` key and stores `(path, key)` tuples so the
+consuming loop reuses the already-computed key instead of recomputing it.
+
+### 12. P2 — `schedule_retry` built a shell command with Python `repr`, not shell quoting — Fixed + verified
+
+`f"... {sys.executable!r} {script!r}"` inside a `/bin/sh -c` string used
+Python quoting, not POSIX quoting -- a repo path containing a single quote
+produced a broken, in-principle-injectable command line.
+
+**Fix:** dropped the shell entirely; the child does `time.sleep()` then
+`runpy.run_path()` directly, so there's no quoting to get wrong.
+
+**Verified:** a script at a path containing a literal single quote
+(`/tmp/Anna's Docs/dummy_script.py`) now runs correctly end to end via the
+new `subprocess.Popen` argv list, with no shell involved.
+
+### 13. P2 — the literal-asterisk sentinel traveled through the LLM, and model-emitted asterisks were deleted — Fixed + verified (both halves)
+
+`ASTERISK_SENTINEL` (U+F8FF, Apple's corporate private-use codepoint) was
+sent through `translate()` verbatim, with nothing guaranteeing a model
+tokenizes or reproduces an obscure PUA character faithfully. Separately,
+`text_to_html`'s `esc()` dropped *every* unmatched `*` unconditionally --
+so a footnote star, birth-date asterisk, or markdown bullet the model itself
+emitted in its *output* vanished silently.
+
+**Fix:** `strip_sentinel_for_model`/`restore_sentinel_from_model` swap the
+sentinel for a plainer placeholder (`XASTERISKX`) just for the
+`translate()` round trip, restoring immediately on return -- the sentinel
+itself never reaches the model. `esc()` no longer strips a leftover `*`;
+it's kept as a literal character (html.escape doesn't treat `*` as special),
+so deletion is no longer the default for the model's own asterisks.
+
+**Verified:** `strip_sentinel_for_model`/`restore_sentinel_from_model`
+round-trip exactly (`tests/test_units.py`); `text_to_html("2 * 4 = 8")` now
+renders the arithmetic literally instead of deleting the asterisk.
+
+### 14. P2 — watcher state/temp files lived inside the watched folder — Fixed + verified
+
+A macOS Folder Action fires on *item added*, so the watcher's own
+bookkeeping files (`.auto_translate_state.json`, the progress log, the
+retry marker) re-triggered the very Folder Action that runs the script.
+`.translate_progress.log` also grew without bound.
+
+**Fix:** state, progress log, retry marker, and the lock file all moved to
+`~/Library/Application Support/auto_translate_pdf/`; only the append-only,
+human-facing `translate_log.csv` stays in the watched folder. The progress
+log truncates past 5MB. `translate_pdf.py`'s `.part` temp file now has a
+leading dot on the *filename* (`.Bericht_en.pdf.part`, not
+`Bericht_en.pdf.part`), so it doesn't surface as a visible new item either.
+
+**Verified:** `LOCK_FILE`/`STATE_FILE`/`PROGRESS_FILE`/`RETRY_MARKER` all
+resolve under the new Application Support subdirectory; a real
+`process_pdf` run produces a `.` -prefixed `.part` temp file.
+
+### 15. P2 — `mlx-lm` was a hard install requirement for Apple-Silicon-only code — Fixed + verified
+
+`requirements.txt` pinned `mlx-lm`, which only installs on Apple Silicon --
+but `--check`, `--reformat-only`, and `tests/test_golden.py` need only
+PyMuPDF, and couldn't be run at all on Linux, Intel Mac, or CI.
+
+**Fix:** split into `requirements.txt` (just `pymupdf`) and
+`requirements-mlx.txt` (pulls in the base file plus `mlx-lm` and
+`huggingface_hub`). No code change needed -- `mlx_lm` was already imported
+lazily inside `load_model`/`translate`, never at module scope.
+
+**Verified:** `python -m py_compile translate_pdf.py` and the full test
+suite (`test_golden.py`, `test_units.py`, `test_layout.py`) all run with
+only `pymupdf` installed.
+
+### 16. P2 — no CI — Fixed
+
+`.github/workflows/test.yml` runs `tests/test_golden.py` and
+`tests/test_units.py` on stock `ubuntu-latest` with `fonts-liberation`
+installed, using just `requirements.txt` (see Finding 15). Both test files
+already exit non-zero on failure, so no extra wiring was needed.
+
+### 17. P2 — test-coverage gaps — Fixed (partial: units + targeted layout cases; full multi-fixture matrix not attempted)
+
+The golden test covered one page, one layout, the happy path. Added:
+
+- `tests/test_units.py`: plain-assert unit tests over the pure functions
+  (`join_paragraph_lines` across all four branches × italic × dehyphenate,
+  `text_to_html`, `as_marker_digits`, `span_is_footnote_marker`,
+  `preserve_footnote_markers`, `bad_translation_reason`, `parse_page_range`,
+  `modal_left_margin`, `detect_columns`) -- these would have caught Finding
+  5 directly, with no PDF involved at all.
+- `tests/test_layout.py`: the overflow/rescale-vs-pinned-folio collision
+  case (Findings 1, 2), a textual running head staying pinned (Finding 3),
+  multi-page reflow-state-doesn't-leak, and `--reformat-only` end to end.
+
+Not built: a synthetic rotated-page fixture (the audit spot-checked
+`/Rotate 90` by hand and found it correct, "an accident of PyMuPDF's
+coordinate handling, not something the code reasons about") and a dedicated
+multi-column *support* test (only detection is implemented; see Finding 8).
+
+### 18. P2 — `measure_height` was uncached and re-measured on every rescale pass — Fixed + verified
+
+Each call opened a fresh `fitz.Document` and ran a full `insert_htmlbox`
+layout; `fit_placements_to_page`'s rescale loop re-measures *every* flowing
+paragraph on *every* scale step (up to 8 iterations) -- pure overhead in
+reformat-only mode, where there's no model call to dominate it.
+
+**Fix:** `@functools.lru_cache(maxsize=4096)` on `_measure_height_cached`,
+keyed on `(round(width, 1), text, round(fontsize, 2), single_line,
+round(indent, 1))`; the uncached path also now reuses one lazily-created,
+process-lifetime scratch `fitz.Document` (adding/dropping a page per call)
+instead of opening a brand new document every time.
+
+**Verified:** 300 repeated measurements of the same paragraph: 1.25s
+uncached vs. 0.006s cached -- roughly a 215× speedup on the repeated-key
+case the rescale loop and reformat-only mode both hit constantly.
+
+### 19. P2 — `AUDIT_FIXES.md` duplicated `README.md` — Fixed
+
+This file's old "What this is" through "License" sections were a
+near-verbatim copy of the README, and had already started drifting from it.
+Cut down to the audit-round record alone, with a one-line pointer to
+`README.md` at the top for the pipeline description.
+
+### 20. P2 — Colab notebook nits — Fixed (all four)
+
+1. The HF-token markdown cell's leftover *"Claude never sees it"* (confusing
+   in a public repo, and inaccurate framing regardless) changed to *"isn't
+   written to the repo."*
+2. The **"Optional: cache the model on Google Drive"** cell used to be the
+   *last* cell in the notebook despite its own comment saying "Run this
+   BEFORE section 3's model load" -- moved it to just before section 3, and
+   updated the now-accurate comment.
+3. `!pip install -q transformers accelerate bitsandbytes pymupdf` was
+   unpinned while the local path pins everything -- pinned all four
+   (`transformers==4.57.1 accelerate==1.1.1 bitsandbytes==0.45.0
+   pymupdf==1.28.2`).
+4. `output_path = input_path.rsplit(".", 1)[0] + "_en.pdf"` re-implemented
+   `scripts/auto_translate_pdf.py`'s `output_path()` and lost extension
+   case -- the exact thing Round 2 leftover #8 fixed locally. Replaced with
+   the same `Path.with_name(f"{stem}_en{suffix}")` logic (reimplemented
+   rather than imported, since the notebook only clones `translate_pdf.py`,
+   not `scripts/`).
+
+**Verified:** the notebook's JSON structure (`nbformat`, cell count, cell
+ordering) parses cleanly after all four edits; a stale "see the optional
+cell below" reference in the Notes section (pointing at where the Drive-
+cache cell used to sit) was caught and fixed too.
+
+### 21. P2 — `--pages` produced a mixed-language PDF with no notice — Fixed + verified
+
+Translating pages 1-5 of a 40-page document silently left pages 6-40
+German with nothing on stderr or in the output to say so; `parse_page_range`
+also silently discarded an out-of-range segment when other segments in the
+same `--pages` spec were valid, hiding a typo (`--pages 1-3,99` on a 5-page
+doc quietly became pages 1-3).
+
+**Fix:** the CLI now prints `translating N of M page(s); the remaining K
+page(s) are copied through untranslated` up front; `parse_page_range` takes
+an optional `warn` callback invoked once per segment that selects no pages,
+independent of whether the *combined* result across all segments is
+non-empty.
+
+**Verified** via `tests/test_units.py`: `--pages 1-3,99` on a 5-page
+document returns `[0, 1, 2]` and fires exactly one warning naming the `99`
+segment.
+
+### 22. P2 — assorted smaller items — Fixed (all six)
+
+- `main(argv=None)` now wraps the CLI (importable/testable directly, e.g.
+  `main(["in.pdf", "--check"])`, rather than only invocable as a
+  subprocess).
+- `fitz.open(args.input)` failures now go through `ap.error()` with a
+  readable message instead of a raw traceback.
+- `doc.metadata["title"]` is now translated too (only the title -- not
+  `/Subject`/`/Keywords`, rarely populated and not worth a second
+  translation request per document), with the same `bad_translation_reason`
+  sanity check (Finding 10) guarding it.
+- Known limitations (README) now notes that link/widget annotation rects go
+  stale after reflow (a paragraph's rect moves; the annotation pointing at
+  it doesn't), and that only the document title is translated.
+- The German-specific space-before-punctuation regex
+  (`re.sub(r"\s+([.,;:!?])", r"\1", text)`) now has a comment noting the
+  assumption and its French-quoted-passage failure mode.
+- The watcher's `is_translated_output` false-positive case (a genuinely
+  German source file that happens to end in `_en`) now logs at debug level
+  behind `AUTO_TRANSLATE_DEBUG=1`, off by default to avoid spamming
+  `progress.log` on every run for a file that's silently re-skipped
+  forever either way.
+- `dominant_size`'s empty-input fallback (`10.0`) and
+  `split_page_into_paragraphs`'s empty-spans fallback (`"Times-Roman"`)
+  were repeated magic literals at two call sites each -- hoisted to
+  `FALLBACK_FONT_SIZE`/`FALLBACK_FONT_NAME`.
+
+---
+
+All 22 of Round 4's findings are applied: 20 fixed and verified, plus 2
+fixed by code inspection/reasoning only (6, 9 -- both are in the
+mlx-lm/model-generation path, which needs real Apple Silicon hardware to
+verify against the actual model; unavailable in this environment). Nothing
+from this round was skipped or left as won't-fix.

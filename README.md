@@ -24,8 +24,15 @@ at-a-time notebook.
 git clone https://github.com/materialcritic/auto-translate-pdf.git
 cd auto-translate-pdf
 python3 -m venv venv
-./venv/bin/pip install -r requirements.txt
+./venv/bin/pip install -r requirements-mlx.txt
 ```
+
+`requirements.txt` (just `pymupdf`) is enough on its own for `--check`,
+`--reformat-only`, and `tests/test_golden.py` — none of those load a model,
+so `mlx-lm` (Apple-Silicon-only) isn't needed for them. Anyone on Linux or
+Intel Mac, or a CI runner, can install just `requirements.txt` to run the
+tests. `requirements-mlx.txt` pulls in `requirements.txt` plus `mlx-lm` and
+`huggingface_hub` for actual translation.
 
 The model (`mlx-community/translategemma-4b-it-4bit`, ~2.1 GB) downloads once
 on first run and is cached under `~/.cache/huggingface/hub/` — no re-download
@@ -232,11 +239,25 @@ non-zero if anything fails.
   fluent, idiomatic English on academic German prose, but isn't a substitute
   for professional translation of anything high-stakes.
 - **Only handles single-column, prose-heavy layouts well.** No table
-  support, no multi-column layout support. Embedded images/figures are left
-  untouched (the page-wide text redaction explicitly excludes them) but
-  aren't captioned or otherwise processed.
+  support, no multi-column reflow support (a two-column page is now
+  *detected* — `--check` and `process_pdf` both warn, and `process_pdf`
+  refuses to translate a detected multi-column page unless `--force` is
+  passed — but there's no column-aware reflow, so `--force`ing one through
+  still zips the columns together into one scrambled paragraph). Embedded
+  images/figures are left untouched (the page-wide text redaction
+  explicitly excludes them) but aren't captioned or otherwise processed.
+- **Link and form-widget annotations aren't updated after reflow.** A link
+  or widget's rect still points at wherever the *original* German text sat;
+  once a paragraph grows, shrinks, or shifts, that rect no longer lines up
+  with the translated text drawn in its place. The document's `/Title`
+  metadata is translated (nothing else — outline/bookmarks and other
+  metadata fields stay German).
 - Assumes German → English. There's no language auto-detection; dropping a
   non-German PDF will still run it through the DE→EN model.
+- A source PDF genuinely named to end in `_en` (e.g. `Anhang_en.pdf`, not a
+  prior translation output) is treated as already-translated and skipped by
+  the watcher with no message — `is_translated_output`'s suffix check has
+  no way to tell the two cases apart.
 - Each run loads a ~2 GB model into memory — a full 14-page document took
   about 7 minutes end-to-end on a base M1 Air. Dropping several PDFs in
   quick succession queues them (via a lock file) rather than running

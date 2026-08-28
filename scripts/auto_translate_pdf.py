@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 import fcntl
 import json
+import os
 import subprocess
 import sys
 import time
@@ -27,13 +28,25 @@ FOLDER = Path.home() / "Translate"
 EN_SUFFIX = "_en"
 MAX_ATTEMPTS = 3  # give up on a file after this many failed runs
 
-STATE_FILE = FOLDER / ".auto_translate_state.json"
+# A macOS Folder Action fires on *item added* to FOLDER -- so any of this
+# script's own bookkeeping files that live inside FOLDER re-trigger the very
+# Folder Action that runs this script. Each spurious trigger is cheap (it
+# hits the flock and either finds nothing pending or re-processes an
+# already-done file for free), but it's an avoidable feedback loop, and it
+# clutters the folder the user is actually looking at. Only the human-
+# facing translate_log.csv stays in FOLDER: it's append-only, so it doesn't
+# re-trigger after its own creation, and it's the one file a user watching
+# this folder would actually want to find there.
+APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "auto_translate_pdf"
+STATE_FILE = APP_SUPPORT_DIR / "state.json"
+PROGRESS_FILE = APP_SUPPORT_DIR / "progress.log"
+RETRY_MARKER = APP_SUPPORT_DIR / "retry_pending"
 LOG_FILE = FOLDER / "translate_log.csv"
-PROGRESS_FILE = FOLDER / ".translate_progress.log"
-RETRY_MARKER = FOLDER / ".auto_translate_retry_pending"
 RETRY_DELAY = 150.0  # seconds; comfortably longer than wait_until_stable's 120s timeout
 
-LOCK_FILE = Path.home() / "Library" / "Application Support" / "auto_translate_pdf.lock"
+LOCK_FILE = APP_SUPPORT_DIR / "auto_translate_pdf.lock"
+
+PROGRESS_LOG_MAX_BYTES = 5 * 1024 * 1024  # rotate (truncate) past this size
 
 # translate_pdf.py and its DEFAULT_MODEL live at the repo root, one level up
 # from this script (repo_root/scripts/auto_translate_pdf.py) -- not on the
@@ -95,15 +108,36 @@ def is_translated_output(p: Path) -> bool:
     return p.stem.lower().endswith(EN_SUFFIX)
 
 
-def file_key(p: Path) -> str:
+def file_key(p: Path) -> str | None:
     """Path alone is not enough: replacing a file with a corrected scan
     under the same name would otherwise be skipped forever as 'already
     done', since done/attempts/failed are keyed on nothing but the relative
     path. Folding in size and mtime means a replaced file gets a new key
     and is retranslated once; old state-file entries just won't match the
-    new key and degrade gracefully rather than erroring."""
-    st = p.stat()
+    new key and degrade gracefully rather than erroring.
+
+    Returns None if `p` no longer exists -- a normal thing to happen to a
+    file sitting in a watched drop folder between the initial rglob() and
+    this being called (the user moves it, an editor does an atomic
+    save-and-replace, etc.). An uncaught FileNotFoundError here used to
+    take down the whole run, including every file queued behind it."""
+    try:
+        st = p.stat()
+    except OSError:
+        return None
     return f"{p.relative_to(FOLDER)}:{st.st_size}:{int(st.st_mtime)}"
+
+
+def rotate_progress_log_if_needed() -> None:
+    """`.translate_progress.log` grows without bound -- every paragraph of
+    every document ever translated, appended forever, one open() per line.
+    Truncate (not delete, so a tail -f watching it doesn't need to reopen)
+    once it passes PROGRESS_LOG_MAX_BYTES."""
+    try:
+        if PROGRESS_FILE.stat().st_size > PROGRESS_LOG_MAX_BYTES:
+            PROGRESS_FILE.write_text("")
+    except FileNotFoundError:
+        pass
 
 
 def progress(line: str) -> None:
@@ -197,8 +231,17 @@ def schedule_retry() -> None:
         return
     RETRY_MARKER.write_text(str(time.time()))
     script = str(Path(__file__).resolve())
+    # No shell involved, so no quoting to get wrong: `!r` (Python repr, not
+    # POSIX quoting) inside a "/bin/sh -c ..." string used to build a
+    # broken -- and in principle injectable -- command line for any repo
+    # path containing a shell-special character (a single quote, e.g.
+    # "/Users/me/Anna's Docs/auto-translate-pdf"). Sleeping in the child
+    # and calling runpy directly needs no shell at all.
     subprocess.Popen(
-        ["/bin/sh", "-c", f"sleep {RETRY_DELAY} && exec {sys.executable!r} {script!r}"],
+        [sys.executable, "-c",
+         "import runpy, sys, time; time.sleep(float(sys.argv[1])); "
+         "sys.argv = [sys.argv[2]]; runpy.run_path(sys.argv[0], run_name='__main__')",
+         str(RETRY_DELAY), script],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
@@ -226,6 +269,7 @@ def main():
 
 def _main():
     FOLDER.mkdir(parents=True, exist_ok=True)
+    rotate_progress_log_if_needed()
     cleanup_stale_part_files()
     state = load_state()
     done = set(state["done"])
@@ -242,12 +286,28 @@ def _main():
     # but Path.rglob is not, so "*.pdf" alone silently skips a scanner- or
     # Windows-exported "Bericht.PDF".
     pdfs = sorted(p for p in FOLDER.rglob("*") if p.is_file() and p.suffix.lower() == ".pdf")
-    pending = [
-        p for p in pdfs
-        if not is_translated_output(p)
-        and file_key(p) not in done
-        and file_key(p) not in failed
-    ]
+    pending = []
+    debug = bool(os.environ.get("AUTO_TRANSLATE_DEBUG"))
+    for p in pdfs:
+        if is_translated_output(p):
+            if debug:
+                # A source PDF genuinely named to end in "_en" (not a prior
+                # translation output) is indistinguishable from one and
+                # gets skipped here with no message by default -- opt into
+                # AUTO_TRANSLATE_DEBUG=1 to see which files this affects.
+                print(f"  DEBUG: skipping {p.relative_to(FOLDER)} "
+                      f"(name ends in {EN_SUFFIX!r}, assumed already translated)")
+            continue
+        key = file_key(p)
+        if key is None:
+            # Disappeared (moved/deleted) between the rglob() above and
+            # here -- a normal thing to do to a file in a watched drop
+            # folder. Skip it instead of crashing; the next trigger will
+            # either not see it at all, or see it again with a fresh key.
+            continue
+        if key in done or key in failed:
+            continue
+        pending.append((p, key))
 
     if not pending:
         print("No new files to process.")
@@ -261,7 +321,7 @@ def _main():
     # found on this machine) is caught and logged instead of propagating
     # out of _main() past the lock's release with nothing recorded.
     try:
-        from translate_pdf import DEFAULT_MODEL, process_pdf
+        from translate_pdf import DEFAULT_MODEL, UnsupportedInputError, process_pdf
     except Exception as e:
         print(f"FATAL: cannot import translate_pdf: {e}")
         progress(f"FATAL: cannot import translate_pdf: {e}")
@@ -273,8 +333,7 @@ def _main():
         return
 
     still_copying = False
-    for p in pending:
-        key = file_key(p)
+    for p, key in pending:
         out = output_path(p)
 
         if out.exists():
@@ -293,6 +352,19 @@ def _main():
         progress(f"start: {key}")
         try:
             process_pdf(str(p), str(out), DEFAULT_MODEL, progress_callback=progress)
+        except UnsupportedInputError as e:
+            # An encrypted PDF, an image-only scan, or an empty document
+            # will fail identically on every attempt -- go straight to
+            # `failed` instead of burning MAX_ATTEMPTS retries that can't
+            # possibly succeed, so the real problem (needs OCR, needs a
+            # password) surfaces immediately instead of after 3 wasted runs.
+            print(f"    UNSUPPORTED: {e}")
+            progress(f"  {key}: UNSUPPORTED: {e}")
+            log_result(key, "", f"unsupported: {e}")
+            failed[key] = str(e)
+            attempts.pop(key, None)
+            commit()
+            continue
         except Exception as e:
             attempts[key] = attempts.get(key, 0) + 1
             print(f"    ERROR: {e}")

@@ -1,0 +1,5 @@
+# For actual translation (Apple Silicon only). --check, --reformat-only,
+# and tests/test_golden.py need only requirements.txt.
+-r requirements.txt
+mlx-lm==0.31.3
+huggingface_hub==1.28.0
