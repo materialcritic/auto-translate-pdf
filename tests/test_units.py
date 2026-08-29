@@ -304,7 +304,18 @@ check("detect_columns: empty input is 1 column",
       tp.detect_columns([], page_width=468.0) == 1)
 
 
-def test_all_checks():
+def test_malformed_input():
+    """Test handling of malformed input"""
+    malformed_input = "This is some malformed input with no proper structure"
+    try:
+        # Try to process malformed input
+        result = tp.join_paragraph_lines([malformed_input], True)
+        check("malformed input should be handled gracefully", True, result)
+    except Exception as e:
+        check("malformed input should not raise an error", False, str(e))
+
+
+def test_large_document():
     """Synthetic pytest entry point -- see tests/test_layout.py's copy of
     this docstring for why (Round 5 Finding 13)."""
     assert not failures, f"{len(failures)} check(s) failed: {', '.join(failures)}"
@@ -312,6 +323,7 @@ def test_all_checks():
 
 if __name__ == "__main__":
     print()
+    test_invalid_pdf()
     if failures:
         print(f"{len(failures)} check(s) FAILED: {', '.join(failures)}")
     else:

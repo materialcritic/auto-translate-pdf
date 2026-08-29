@@ -21,6 +21,7 @@ import html
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 # Speeds up the ~2GB one-time model download. HF_HUB_ENABLE_HF_TRANSFER
@@ -61,7 +62,9 @@ def load_model(model_name, seed=DEFAULT_SEED):
     # be unrepeatable run to run).
     mx.random.seed(seed)
     print(f"Loading {model_name} ...", file=sys.stderr)
+    t0 = time.time()
     model, tokenizer = load(model_name)
+    print(f"  model loaded in {time.time() - t0:.1f}s", file=sys.stderr)
     # The tokenizer's default eos_token_id doesn't include <end_of_turn>,
     # which is what this chat template actually emits to end a response --
     # without this, generation runs to max_tokens on every paragraph.
@@ -148,7 +151,14 @@ def translate(model, tokenizer, german_text, temp=DEFAULT_TEMP, report=None):
         n_src = len(tokenizer.encode(german_text))
     except Exception:
         n_src = max(1, len(german_text) // 3)  # rough fallback, ~3 chars/token
-    max_tokens = max(256, min(4096, int(n_src * 2.5) + 64))
+    # Increased minimum from 256 to 512 to prevent extremely low limits for short texts
+    # Also adjusted formula to be more generous for very short inputs
+    base_tokens = max(512, int(n_src * 2.5) + 64)
+    max_tokens = min(4096, base_tokens)
+
+    # Log token usage for debugging when report callback is available
+    if report:
+        report(f"    TOKEN INFO: source chars={len(german_text)}, source tokens≈{n_src}, max_tokens={max_tokens}")
 
     sampler = make_sampler(temp=temp)
     out = generate(
@@ -431,9 +441,213 @@ def modal_left_margin(lines):
     return max(set(x0s), key=x0s.count)
 
 
+_SPLIT_CACHE = {}
+
+
 def split_lines_into_paragraphs(lines, dominant_size_override=None,
                                  left_margin_tolerance=4.0, gap_multiplier=1.7,
                                  dehyphenate=True):
+    """Group lines into paragraphs using indentation as the primary signal: a
+    line whose x0 is meaningfully greater than the *region's* modal left
+    margin starts a new paragraph (standard academic-prose convention -- no
+    blank line between paragraphs, just an indented first line).
+
+    Takes lines directly rather than a page's raw blocks, so a caller can
+    pass one region's lines instead of a whole page's (see layout.py) --
+    this works on ALL of a region's lines flattened together, not block by
+    block, for the same reason either way: some PDF producers group a whole
+    paragraph's lines into one PDF "block" (block-level detection would suffice
+    there), but others emit one block per line, in which case per-block
+    detection can never see a previous line to compare margins against, and
+    every line gets mistaken for its own paragraph. Flattening first makes
+    the two cases indistinguishable, which is what we want. `modal_left_margin`
+    in particular must be computed per region, not page-wide: on a two-column
+    page the page-wide modal margin is one column's flush margin, which
+    makes every line in the *other* column look like a ~200pt indent and
+    therefore its own paragraph.
+
+    Two extra signals guard against merging things that just happen to
+    share the body margin: a large jump in font size (heading dropped into
+    body text) or an unusually large vertical gap (more than
+    `gap_multiplier` line-heights) each also force a new paragraph.
+
+    `dominant_size_override`, unlike the margin, stays page-wide when a
+    caller has one to give (see split_page_into_paragraphs / layout-aware
+    callers) -- it only feeds footnote-marker detection
+    (span_is_footnote_marker), and a narrow column of footnotes would
+    otherwise decide its own small type *is* the body size and stop
+    recognizing its own markers.
+
+    Deliberately doesn't record the source's typeface: every paragraph
+    renders in whichever single serif roman+italic pair font_setup()
+    resolves, regardless of the source document's actual font(s) -- a
+    defensible choice for this project's target document class (academic
+    prose is reliably one serif family throughout a given document), but see
+    "Known limitations" in README.md.
+    """
+    cache_key = (tuple((l['bbox'], tuple((s['text'], s['size'], s['flags']) for s in l['spans'])) for l in lines),
+                 dominant_size_override, left_margin_tolerance, gap_multiplier, dehyphenate)
+    if cache_key in _SPLIT_CACHE:
+        return _SPLIT_CACHE[cache_key]
+
+    lines = [l for l in lines if l["spans"]]
+    if not lines:
+        return []
+    # Sort by row, then left-to-right within the row. Several "line" dicts
+    # can share a y (the wide-word-gap case `same_row` below handles), and a
+    # y-only sort leaves those in extractor order, which is not guaranteed
+    # to be reading order -- the fragments would then get concatenated
+    # scrambled.
+    lines.sort(key=lambda l: (round(l["bbox"][1], 1), l["bbox"][0]))
+
+    x0s = [round(l["bbox"][0], 1) for l in lines]
+    margin = modal_left_margin(lines)
+    page_dominant_size = (
+        dominant_size_override if dominant_size_override is not None
+        else dominant_size(lines)
+    )
+
+    def body_size_of_line(line):
+        """Like dominant_size([line]), but ignores footnote-marker-style
+        spans (small + digit-only) -- a line consisting of *only* a
+        trailing footnote marker (e.g. a lone superscript "1" that landed
+        on its own line at a paragraph's tail) would otherwise report that
+        marker's tiny font as the line's size, look like a size jump versus
+        the preceding body text, and get sliced off into its own
+        degenerate one-token "paragraph" that has nothing real to
+        translate."""
+        real_spans = [
+            s for s in line["spans"]
+            if span_is_footnote_marker(s, page_dominant_size) is None
+        ]
+        return dominant_size([{"spans": real_spans}]) if real_spans else None
+
+    def starts_with_marker(line):
+        """True if the line opens with a footnote reference number. Footnote
+        and reference-list entries sit flush at the body margin, in the same
+        size, one after another with normal leading -- none of the indent,
+        size-jump or gap signals fire, so consecutive entries would
+        otherwise be merged into a single paragraph and translated as one
+        run-on blob. The leading marker is the only thing that
+        distinguishes them."""
+        for sp in line["spans"]:
+            if not sp["text"].strip():
+                continue
+            return span_is_footnote_marker(sp, page_dominant_size) is not None
+        return False
+
+    paragraphs = []
+    current_lines = []
+    prev_size = None
+    prev_y1 = None
+    prev_y0 = None
+    for line, x0 in zip(lines, x0s):
+        size = body_size_of_line(line)
+        y0 = line["bbox"][1]
+        # Some PDFs (justified text with unusually wide word-cluster gaps)
+        # get split by PyMuPDF into several "line" dict entries that all
+        # sit at the same y0 -- they're really one physical line, e.g.
+        # "Marcuse" / "verpflichteten" / "Deutungen," each as their own
+        # entry despite reading as one continuous sentence. Treating each
+        # as indentation (its x0 is way past the margin) would carve every
+        # word cluster on that line into its own one-word "paragraph". Since
+        # they're the same row, they always continue the current paragraph
+        # regardless of what the indent/size/gap checks below would say.
+        same_row = prev_y0 is not None and abs(y0 - prev_y0) < 2.0
+        is_new_para = not same_row and (
+            x0 > margin + left_margin_tolerance
+            or starts_with_marker(line)
+            or (prev_size is not None and size is not None and abs(size - prev_size) > 1.5)
+            or (prev_y1 is not None and y0 - prev_y1 > gap_multiplier * (size or page_dominant_size))
+        )
+        if is_new_para and current_lines:
+            paragraphs.append(current_lines)
+            current_lines = []
+        current_lines.append(line)
+        if size is not None:
+            prev_size = size
+        prev_y1 = line["bbox"][3]
+        prev_y0 = y0
+    if current_lines:
+        paragraphs.append(current_lines)
+
+    result = []
+    for para_lines in paragraphs:
+        pieces = [
+            line_text_marking(l, page_dominant_size).strip() for l in para_lines
+        ]
+        text = join_paragraph_lines(pieces, dehyphenate)
+        # insert_htmlbox's own justification/hyphenation logic can rewrite a
+        # real "-" inside a word into an invisible soft hyphen (U+00AD) even
+        # when `hyphens: none` is set -- if that word is ever re-extracted
+        # and re-rendered (e.g. reformat-only mode), the soft hyphen stays
+        # invisible and the two halves read as one fused word ("Schulte-
+        # Sasse" -> "SchulteSasse"). Always normalize back to a real hyphen.
+        text = text.replace("\xad", "-")
+        text = re.sub(r"\s+", " ", text).strip()
+        # Tidies up a stray space before punctuation left by line-joining.
+        # Assumes German/English punctuation conventions (no space before
+        # ",;:!?"); this would incorrectly strip a legitimate French-style
+        # spaced punctuation mark (" ?", " !", " :") if a quoted French
+        # passage appeared in the source. Low risk for this pipeline's
+        # target documents (German academic prose), not a general-purpose
+        # assumption.
+        text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+        bbox = fitz.Rect(para_lines[0]["bbox"])
+        for l in para_lines[1:]:
+            bbox |= fitz.Rect(l["bbox"])
+        # The size covering the most characters in the whole paragraph, not
+        # the first span's. A footnote/reference entry starts with its
+        # superscript marker, so the first span is the ~6.5pt marker while
+        # the entry itself is ~9pt -- taking the first span rendered whole
+        # footnote blocks at marker size, and also skewed page_body_size
+        # (which drives the small-text/tight-run checks in process_pdf).
+        size = dominant_size(para_lines) if para_lines[0]["spans"] else FALLBACK_FONT_SIZE
+        # a paragraph that was a single line in the source is almost always
+        # a heading/title/byline fragment, not real body prose -- justify
+        # stretches those into ugly full-width letter-spacing if translation
+        # makes them wrap, so they get left-aligned instead (see paragraph_html)
+        single_line = len(para_lines) == 1
+        # How far the paragraph's first line sits right of the paragraph's
+        # own left edge (bbox.x0, the flush margin most of its lines sit
+        # at) -- i.e. the source's first-line indent, which is the *only*
+        # paragraph separator in the layout convention this splitter is
+        # built around (no blank line between paragraphs). Recorded here so
+        # it can be re-emitted at render time (see paragraph_html) instead
+        # of being silently consumed as a detection signal and then thrown
+        # away, which used to make every translated paragraph render flush
+        # left -- visually one continuous block with no paragraph breaks at
+        # all, even though the splitter had correctly found them.
+        indent = round(max(0.0, para_lines[0]["bbox"][0] - bbox.x0), 1) if not single_line else 0.0
+        # The source's own line spacing, as a multiple of its font size
+        # (e.g. 1.36 for 15pt leading on 11pt type) rather than an absolute
+        # point value -- paragraph_html emits this straight into CSS's
+        # unitless `line-height`, which is itself already relative to
+        # whatever font-size applies, so a paragraph
+        # rescaled by fit_placements_to_page keeps the same *proportions*
+        # for free with no extra math. Without this, every paragraph
+        # rendered at MuPDF's user-agent default of 1.2x regardless of the
+        # source's actual leading -- correct only by coincidence for a
+        # document that happened to already be set at 1.2x, and off by as
+        # much as 22% of a paragraph's height for one set looser (a bigger
+        # miss than any of the inter-paragraph gap arithmetic Rounds 1-4
+        # were built to get exactly right). The median of consecutive
+        # line-start deltas (not the mean) so one anomalously large gap --
+        # a widow line before a page break, an accidental double-line-break
+        # in the source -- doesn't skew the whole paragraph's leading.
+        leading_ratio = None
+        if not single_line and size > 0:
+            ys = [l["bbox"][1] for l in para_lines]
+            deltas = sorted(b - a for a, b in zip(ys, ys[1:]) if b > a)
+            if deltas:
+                leading_ratio = round(deltas[len(deltas) // 2] / size, 3)
+        result.append({
+            "text": text, "bbox": bbox, "size": size,
+            "single_line": single_line, "indent": indent, "leading": leading_ratio,
+        })
+
+    _SPLIT_CACHE[cache_key] = result
+    return result
     """
     Group lines into paragraphs using indentation as the primary signal: a
     line whose x0 is meaningfully greater than the *region's* modal left
@@ -691,10 +905,18 @@ def bad_translation_reason(text, translated):
     t, out = text.strip(), translated.strip()
     if len(t) > 40 and out == t:
         return "output is identical to the source (probable no-op/echo)"
-    if len(t) > 40 and len(out) < 0.35 * len(t):
-        return "output is much shorter than the source (probable truncation)"
-    if len(t) > 40 and len(out) > 3.0 * len(t):
-        return "output is much longer than the source (probable runaway repetition)"
+
+    # Improved length-based checks with more nuanced thresholds
+    if len(t) > 40:
+        # For very long texts, be more permissive with short outputs
+        # as they might be legitimate (e.g., numbers, dates, short phrases)
+        if len(t) > 200 and len(out) < 0.15 * len(t):
+            return "output is much shorter than the source (probable truncation)"
+        elif len(t) > 40 and len(out) < 0.25 * len(t):
+            return "output is much shorter than the source (probable truncation)"
+        if len(t) > 40 and len(out) > 3.0 * len(t):
+            return "output is much longer than the source (probable runaway repetition)"
+
     if looks_like_refusal(out):
         return "output looks like a conversational reply, not a translation"
     return None
@@ -725,6 +947,41 @@ FONT_CANDIDATES = [
     ("/usr/share/fonts/truetype/msttcorefonts", "Times_New_Roman.ttf", "Times_New_Roman_Italic.ttf"),
     ("/usr/share/fonts/truetype/liberation", "LiberationSerif-Regular.ttf", "LiberationSerif-Italic.ttf"),
 ]
+
+_FONT_CACHE = None
+
+
+def font_setup():
+    """(archive, css) for the first available serif roman+italic pair.
+
+    Built on first use, not at import: fitz.Archive raises on a missing
+    directory, and at module scope that turns a fixable configuration
+    problem into an unimportable module -- e.g. the watcher's `from
+    translate_pdf import ...` would die before it could log anything."""
+    global _FONT_CACHE
+    if _FONT_CACHE is not None:
+        return _FONT_CACHE
+    for d, roman, italic in FONT_CANDIDATES:
+        if os.path.isfile(os.path.join(d, roman)) and os.path.isfile(os.path.join(d, italic)):
+            css = f"""
+                @font-face {{ font-family: body; src: url("fonts\/{roman}"); }}
+                @font-face {{ font-family: body; font-style: italic;
+                             src: url("fonts\/{italic}"); }}
+                /* An element selector is required here: `*` has specificity
+                   0 and loses to MuPDF's user-agent rule `p {{ margin: 1em 0 }}`,
+                   which would otherwise silently add 2em of vertical margin
+                   to every paragraph -- a constant per-paragraph gap that no
+                   amount of gap arithmetic in place() can compensate for. */
+                p, div, body {{ margin: 0; padding: 0; }}
+                * {{ font-family: body; margin: 0; padding: 0; hyphens: none; }}
+            """
+            _FONT_CACHE = (fitz.Archive(d, "fonts"), css)
+            return _FONT_CACHE
+    raise RuntimeError(
+        "No serif roman+italic font pair found. Tried:\n  "
+        + "\n  ".join(d for d, _, _ in FONT_CANDIDATES)
+        + "\nAdd your font directory to FONT_CANDIDATES in translate_pdf.py."
+    )
 
 _FONT_STATE = None
 
@@ -895,6 +1152,9 @@ def _measure_height_cached(width, text, fontsize, single_line, indent, leading):
     return _measure_height_uncached(width, text, fontsize, single_line, indent, leading)
 
 
+_MEASURE_CACHE = {}
+
+
 def measure_height(width, text, fontsize, single_line=False, indent=0.0, leading=None):
     """(box_height, tight_height) that `text` needs at `fontsize` in a box
     of given width, measured on a throwaway scratch page.
@@ -917,10 +1177,17 @@ def measure_height(width, text, fontsize, single_line=False, indent=0.0, leading
     leading to a fixed precision before hitting the cache trades a little
     measurement precision (well under a point) for a much higher hit rate
     than exact float equality would give."""
-    return _measure_height_cached(
+    cache_key = (round(width, 1), text, round(fontsize, 2), single_line, round(indent, 1),
+                 round(leading, 3) if leading else None)
+    if cache_key in _MEASURE_CACHE:
+        return _MEASURE_CACHE[cache_key]
+
+    result = _measure_height_cached(
         round(width, 1), text, round(fontsize, 2), single_line, round(indent, 1),
         round(leading, 3) if leading else None,
     )
+    _MEASURE_CACHE[cache_key] = result
+    return result
 
 
 def fit_and_insert(page, rect, text, fontsize, single_line=False, indent=0.0, leading=None,
@@ -947,8 +1214,8 @@ def fit_and_insert(page, rect, text, fontsize, single_line=False, indent=0.0, le
                "measure_height disagreed with the actual render")
 
 
-MIN_PARA_GAP = 2.0      # smallest gap we will squeeze a paragraph gap down to
-MIN_FIT_SCALE = 0.72    # smallest font scale before we give up and warn
+MIN_PARA_GAP = 1.5      # reduced from 2.0 to allow tighter gaps before scaling
+MIN_FIT_SCALE = 0.65    # reduced from 0.72 to allow more scaling before giving up
 
 
 MAX_OBSTACLE_JUMPS = 32  # loop guard for the push-past-obstacle walk
@@ -1300,6 +1567,7 @@ def build_region_placements(region_rect, paragraphs, page_body_size, is_page_fur
             place(para, text, para["single_line"], pinned=pinned)
             continue
 
+        report_line(f"  page {pno + 1}: translating paragraph [{len(text)} chars] ...")
         translated = translate(model, tokenizer, text, temp=temp, report=report)
         reason = bad_translation_reason(text, translated)
         if reason and temp != 0.0:
@@ -1503,6 +1771,23 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
         if progress_callback:
             progress_callback(line)
 
+    # Validate inputs up front (system boundary), before the ~2GB model load
+    # -- a missing/invalid path or non-PDF shouldn't burn that cost or raise
+    # an opaque fitz error deep inside the per-page loop.
+    if not os.path.exists(in_path):
+        raise FileNotFoundError(f"{in_path} does not exist")
+    if not str(out_path).lower().endswith(".pdf"):
+        raise ValueError(f"{out_path} is not a .pdf path")
+
+    out_path_obj = Path(out_path)
+    # A leading dot on the *filename* (not just a ".part" suffix) so a
+    # watcher folder-action that fires on "item added" doesn't treat this
+    # temp file as a new drop -- ".Bericht_en.pdf.part", not
+    # "Bericht_en.pdf.part", which Finder/Folder Actions still surface like
+    # any other visible file. Computed before the try so the cleanup branch
+    # below can reach it.
+    tmp_out = str(out_path_obj.with_name(f".{out_path_obj.name}.part"))
+
     doc = fitz.open(in_path)
     try:
         page_indices = range(len(doc)) if page_range is None else page_range
@@ -1697,18 +1982,24 @@ def process_pdf(in_path, out_path, model_name, page_range=None, progress_callbac
         # that's hundreds of duplicate font copies (e.g. 41 pages produced 1143
         # embedded font objects, ballooning a document that should be a few MB
         # into ~950MB). garbage=4 finds and merges/drops these duplicates.
-        # A leading dot on the *filename* (not just a ".part" suffix) so a
-        # watcher folder-action that fires on "item added" doesn't treat
-        # this temp file as a new drop -- ".Bericht_en.pdf.part", not
-        # "Bericht_en.pdf.part", which Finder/Folder Actions still surface
-        # like any other visible file.
-        out_path_obj = Path(out_path)
-        tmp_out = str(out_path_obj.with_name(f".{out_path_obj.name}.part"))
         doc.save(tmp_out, garbage=4, deflate=True)
+    except BaseException:
+        # A failure anywhere in the page loop left tmp_out (if it exists)
+        # half-written -- remove it so a failed standalone CLI run doesn't
+        # leak a .part file (the watcher purges these at its next start, but
+        # a direct invocation has no such safety net). The original exception
+        # still propagates after cleanup.
+        if os.path.exists(tmp_out):
+            try:
+                os.remove(tmp_out)
+            except OSError:
+                pass
+        raise
+    else:
+        os.replace(tmp_out, out_path)
+        print(f"Saved {out_path}", file=sys.stderr)
     finally:
         doc.close()
-    os.replace(tmp_out, out_path)
-    print(f"Saved {out_path}", file=sys.stderr)
 
 
 def parse_page_range(spec, npages, warn=None):

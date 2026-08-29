@@ -286,6 +286,13 @@ def main():
 
 def _main():
     FOLDER.mkdir(parents=True, exist_ok=True)
+    # The output destination for every PDF lives *inside* FOLDER (output_path
+    # inserts "_en" before the suffix of the input). If FOLDER isn't writable
+    # we'd rather fail loudly here than mid-translation with a confusing
+    # "readonly filesystem" error after loading the model.
+    if not os.access(FOLDER, os.W_OK):
+        print(f"ERROR: watch folder {FOLDER} is not writable", file=sys.stderr)
+        return
     rotate_progress_log_if_needed()
     cleanup_stale_part_files()
     state = load_state()
@@ -368,6 +375,18 @@ def _main():
         print(f"  translating: {key}")
         progress(f"start: {key}")
         try:
+            # Read and log the first 200 chars of the PDF for debugging
+            # This helps us see what text is causing issues
+            try:
+                import fitz
+                doc = fitz.open(str(p))
+                if doc.page_count > 0:
+                    first_page_text = doc[0].get_text("text")[:200]
+                    progress(f"  DEBUG: First 200 chars of input: {repr(first_page_text)}")
+                doc.close()
+            except Exception as e:
+                progress(f"  DEBUG: Could not read PDF for logging: {e}")
+
             process_pdf(str(p), str(out), DEFAULT_MODEL, progress_callback=progress)
         except UnsupportedInputError as e:
             # An encrypted PDF, an image-only scan, or an empty document
@@ -380,6 +399,21 @@ def _main():
             log_result(key, "", f"unsupported: {e}")
             failed[key] = str(e)
             attempts.pop(key, None)
+            commit()
+            continue
+        except (MemoryError, OSError) as e:
+            # Transient, environment-shaped failures (the ~2GB model load
+            # being killed for memory, a disk/temp hiccup) -- these can
+            # succeed on a later attempt, so let the normal attempt counter
+            # handle them rather than retiring the file to `failed`.
+            attempts[key] = attempts.get(key, 0) + 1
+            print(f"    TRANSIENT ERROR: {e}")
+            progress(f"  {key}: TRANSIENT ERROR: {e}")
+            log_result(key, "", f"transient error: {e}")
+            if attempts[key] >= MAX_ATTEMPTS:
+                failed[key] = str(e)
+                print(f"    giving up after {MAX_ATTEMPTS} attempts "
+                      f"(remove '{key}' from {STATE_FILE.name}'s failed list to retry)")
             commit()
             continue
         except Exception as e:
