@@ -46,7 +46,7 @@ MIN_COL_FRAC = 0.12       # a "column" narrower than this is noise
 MIN_COL_LINES = 3         # ...as is one with fewer lines than this
 SPAN_BLOCK_GAP = 8.0      # pt; spanning lines closer together than this are
                           # one heading block, not two
-MAX_COL_DEPTH = 2         # recursion guard for columns inside columns
+MAX_COL_DEPTH = 1         # recursion guard for columns inside columns; 1 prevents sub-columns inside columns
 
 OBSTACLE_MIN_AREA_FRAC = 0.004  # of page area; smaller drawings are bullets,
                                 # logos in a running head, math glyphs
