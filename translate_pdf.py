@@ -338,8 +338,14 @@ def line_text_marking(line, dominant_size):
         elif stripped and span_is_italic(s):
             lead = t[: len(t) - len(t.lstrip())]
             trail = t[len(t.rstrip()):]
-            # A literal "*" inside the span would close this italic run early
-            parts.append(f"{lead}*{stripped.replace('*', ASTERISK_SENTINEL)}*{trail}")
+            # If the text already starts and ends with asterisks, preserve them
+            # but replace internal asterisks with sentinel for model processing
+            if stripped.startswith('*') and stripped.endswith('*') and len(stripped) >= 2:
+                inner = stripped[1:-1]
+                parts.append(f"{lead}*{inner.replace('*', ASTERISK_SENTINEL)}*{trail}")
+            else:
+                # Otherwise, wrap the text in asterisks markers
+                parts.append(f"{lead}*{stripped.replace('*', ASTERISK_SENTINEL)}*{trail}")
         else:
             parts.append(t.replace("*", ASTERISK_SENTINEL))
     return "".join(parts)
@@ -1066,7 +1072,7 @@ def text_to_html(text):
 
     out = []
     pos = 0
-    for m in ASTERISK_RUN_RE.finditer(text):
+    for m in re.finditer(r"(?<![\w*])\*(?<!\s)([^*]+?)(?<!\s)\*(?![\w*])", text):
         out.append(esc(text[pos:m.start()]))
         out.append(f"<i>{esc(m.group(1))}</i>")
         pos = m.end()
@@ -1352,7 +1358,9 @@ def fit_placements_to_region(placements, region_rect, page_rect, obstacles=(),
         for i, (p, h) in enumerate(zip(flowing, heights)):
             if i:
                 g = gaps[i - 1]
-                y += MIN_PARA_GAP + max(0.0, g - MIN_PARA_GAP) * keep
+                # Distribute the gap reduction more evenly
+                gap_reduction = max(0.0, g - MIN_PARA_GAP) * (1 - keep)
+                y += MIN_PARA_GAP + max(0.0, g - MIN_PARA_GAP - gap_reduction * (i / len(gaps)))
             if obstacles:
                 y = _clear_of_obstacles(y, h, p["rect"].x0, p["rect"].x1, obstacles, limit)
             rects.append(fitz.Rect(p["rect"].x0, y, p["rect"].x1, y + h))
@@ -1364,7 +1372,8 @@ def fit_placements_to_region(placements, region_rect, page_rect, obstacles=(),
         rects, sizes, overflow = lay_out(scale)
         if overflow <= 0 or scale <= MIN_FIT_SCALE:
             break
-        scale = max(MIN_FIT_SCALE, scale - 0.04)
+        # More aggressive scale reduction
+        scale = max(MIN_FIT_SCALE, scale - 0.06)
 
     if overflow > 0 and report:
         # "OVERFLOW" is a stable, grep-able prefix distinguishing a genuine
